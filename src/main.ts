@@ -458,6 +458,20 @@ function rebuildFogCanvas(lights: LightSource[], polys: Vec2[][], cw: number, ch
   lights.forEach((src, i) => revealFog(src, polys[i], cw, ch));
 }
 
+function fallbackLightPolygon(source: LightSource): Vec2[] {
+  const radius = (360 * ((source.radius ?? 100) / 100)) / state.camera.zoom;
+  const points: Vec2[] = [];
+  const cone = Math.min(360, Math.max(5, source.cone));
+  const start = cone >= 359.5 ? -Math.PI : source.facing - (cone * Math.PI / 360);
+  const sweep = cone >= 359.5 ? Math.PI * 2 : cone * Math.PI / 180;
+  const samples = cone >= 359.5 ? 32 : 16;
+  for (let index = 0; index <= samples; index += 1) {
+    const angle = start + sweep * (index / samples);
+    points.push({ x: source.x + Math.cos(angle) * radius, y: source.y + Math.sin(angle) * radius });
+  }
+  return cone >= 359.5 ? points : [{ x: source.x, y: source.y }, ...points];
+}
+
 /** Kicks off the Rust-side raycast for the current light set, in the
  * background, as a single batched call (one IPC round-trip covering every
  * light, not one per light). render() never awaits this - it keeps drawing
@@ -476,13 +490,22 @@ async function refreshLightPolys(sig: number, lights: LightSource[], sampleCount
     }));
     const results = await invoke<[number, number][][]>("compute_visibility_batch", { input: { walls, lights: lightReqs, sampleCount } });
     if (request === visibilityRequest) {
-      cachedPolys = results.map(pts => pts.map(([x, y]) => ({ x, y })));
+      cachedPolys = results.map((pts, index) => {
+        const polygon = pts.map(([x, y]) => ({ x, y }));
+        return polygon.length >= 3 ? polygon : fallbackLightPolygon(lights[index]);
+      });
       lastWorldSig = sig;
       lastFogProjSig = null; // force a fog rebuild next frame with the fresh polygons
       requestRender();
     }
   } catch (e) {
     console.error("compute_visibility_batch failed", e);
+    if (request === visibilityRequest) {
+      cachedPolys = lights.map(fallbackLightPolygon);
+      lastWorldSig = sig;
+      lastFogProjSig = null;
+      requestRender();
+    }
   } finally {
     if (request === visibilityRequest) pendingSig = null;
   }
@@ -787,6 +810,8 @@ const ICO2: Record<string, string> = {
   lock: '<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/>',
   unlock: '<rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 7.3-1.8"/>',
   target: '<circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/>',
+  front: '<path d="M12 19V5m0 0-4 4m4-4 4 4"/><path d="M5 20h14"/>',
+  back: '<path d="M12 5v14m0 0-4-4m4 4 4-4"/><path d="M5 4h14"/>',
 };
 function ic2(n: string): string { return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">${ICO2[n]}</svg>`; }
 function positionMenu(x: number, y: number, h?: number): void {
@@ -804,8 +829,10 @@ function openTokenMenu(t: Token, x: number, y: number): void {
     </div>
     <div class="ctx-btn ctx-wide" id="cLockBtn">${ic2(t.locked ? "unlock" : "lock")} ${t.locked ? "Unlock" : "Lock"} token</div>
     <div class="ctx-btn ctx-wide" id="cReposition">${ic2("pin")} Reposition light</div>
-    <div class="ctx-btn ctx-wide" id="cSendBack">Send to back layer</div>
-    <div class="ctx-btn ctx-wide" id="cBringFront">Bring to front layer</div>
+    <div class="ctx-btns">
+      <div class="ctx-btn" id="cSendBack" title="Send to back layer">${ic2("back")}</div>
+      <div class="ctx-btn" id="cBringFront" title="Bring to front layer">${ic2("front")}</div>
+    </div>
     <div class="ctx-row"><span>Light</span><div class="switch ${t.light ? "on" : ""}" id="cLight"></div></div>
     <div class="ctx-row"><span>Follow token facing</span><div class="switch ${t.followToken ? "on" : ""}" id="cFollow"></div></div>
     <div class="row" style="margin:6px 0 0;"><label><span>Cone</span>${numBox("cConeNum", 5, 360, t.cone)}</label><input type="range" id="cCone" min="5" max="360" value="${t.cone}"></div>
