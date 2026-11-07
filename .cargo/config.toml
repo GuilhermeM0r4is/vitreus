@@ -1,0 +1,15 @@
+# Keep development builds comfortable on passively cooled machines. Cargo otherwise
+# uses every available logical CPU, which is great for CI but unnecessarily hot for
+# an interactive desktop project.
+[build]
+jobs = 1
+
+[profile.dev]
+# Debug symbols add significant linker work and are not needed for normal UI work.
+debug = 0
+incremental = true
+
+[profile.release]
+strip = "symbols"
+codegen-units = 1
+lto = "thin"
