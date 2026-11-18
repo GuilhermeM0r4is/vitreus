@@ -1,12 +1,15 @@
 import { invoke } from "@tauri-apps/api/core";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { check as checkForUpdate } from "@tauri-apps/plugin-updater";
+import { relaunch } from "@tauri-apps/plugin-process";
 
 /* ================= domain model ================= */
 interface Vec2 { x: number; y: number; }
 interface LightOffset { dx: number; dy: number; }
 interface Camera { x: number; y: number; zoom: number; }
 
+interface TokenState { kind: string; assetId: string | null; }
 interface Token {
   id: string; kind: string; assetId: string | null;
   x: number; y: number; r: number;
@@ -16,6 +19,10 @@ interface Token {
   locked: boolean; flip: boolean; flipScale: number;
   layer: "back" | "normal" | "front";
   sx: number; sy: number;
+  /** Merged token states (switchable with 1/2/.../9 on the keyboard). A plain
+   * token has no states; a merged token stores each state's visual (kind +
+   * assetId) here and `activeState` picks which one is currently shown. */
+  states: TokenState[]; activeState: number;
 }
 interface Wall { a: Vec2; b: Vec2; }
 interface LightPoint {
@@ -47,6 +54,7 @@ interface AppState {
   wallDraft: Vec2 | null; wallDraftCursor: Vec2 | null;
   selectedToken: string | null; selectedWall: number | null; selectedMap: string | null;
   draggingWallHandle: WallHandle | null; rotatingToken: Token | null; repositioning: string | null;
+  mergingToken: string | null;
   maps: MapAsset[];
   tokenFolders: AssetFolder[]; currentFolder: string;
   mapFolders: AssetFolder[]; currentMapFolder: string;
@@ -74,6 +82,7 @@ const state: AppState = {
   wallDraft: null, wallDraftCursor: null,
   selectedToken: null, selectedWall: null, selectedMap: null,
   draggingWallHandle: null, rotatingToken: null, repositioning: null,
+  mergingToken: null,
   maps: [],
   tokenFolders: [{ id: "root", color: PALETTE[0] }], currentFolder: "root",
   mapFolders: [{ id: "root", color: PALETTE[0] }], currentMapFolder: "root",
@@ -169,7 +178,7 @@ function addToken(kind: string, x: number, y: number, assetId: string | null = n
     lightFacing: -Math.PI / 2, lightFacingTarget: -Math.PI / 2, followToken: true,
     cone: 40, light: true, lightOffset: { dx: 0, dy: 0 },
     locked: false, flip: false, flipScale: 1, sx: 0, sy: 0,
-    layer: "normal",
+    layer: "normal", states: [], activeState: 0,
   };
   state.tokens.push(t);
   markSceneDirty();
@@ -177,7 +186,48 @@ function addToken(kind: string, x: number, y: number, assetId: string | null = n
 }
 addToken("circle", -60, 40);
 const seedToken = addToken("tri", 40, -20);
-state.selectedToken = seedToken.id;
+selectToken(seedToken.id);
+
+/** Creates a copy of a token at a small offset, including its merged states. */
+function duplicateToken(t: Token): Token {
+  pushUndo();
+  const copy: Token = {
+    ...t, id: uid(), x: t.x + 24, y: t.y + 24,
+    states: t.states.map(s => ({ ...s })),
+  };
+  state.tokens.push(copy);
+  markSceneDirty();
+  return copy;
+}
+/** Starts a merge: remembers `t` as the "first" token and waits for the next
+ * token click to complete it (see the mousedown handler below). */
+function beginMergeToken(t: Token): void {
+  state.mergingToken = t.id;
+  canvas.classList.add("merge-mode");
+}
+/** Combines two tokens into one multi-state token. The first token (`a`)
+ * is kept (its position, rotation, light settings, etc. are preserved);
+ * its own current look and `b`'s look become its first two states. If `a`
+ * is already a merged token, `b` is simply appended as a new state. `b`
+ * is removed from the scene. */
+function completeMergeToken(a: Token, b: Token): void {
+  pushUndo();
+  if (a.states.length === 0) a.states.push({ kind: a.kind, assetId: a.assetId });
+  a.states.push({ kind: b.kind, assetId: b.assetId });
+  state.tokens = state.tokens.filter(x => x.id !== b.id);
+  if (state.selectedToken === b.id) selectToken(a.id);
+  state.mergingToken = null;
+  canvas.classList.remove("merge-mode");
+  markSceneDirty();
+}
+/** Switches a merged token to the given 0-based state index, updating its
+ * visible kind/asset in place. A no-op for tokens with no states. */
+function setTokenState(t: Token, index: number): void {
+  if (!t.states.length || index < 0 || index >= t.states.length) return;
+  const s = t.states[index];
+  t.activeState = index; t.kind = s.kind; t.assetId = s.assetId;
+  markSceneDirty();
+}
 
 function loadImage(id: string, url: string): Promise<HTMLImageElement | null> {
   const cached = state.assetImages[id];
@@ -211,7 +261,7 @@ async function addMapObject(assetId: string): Promise<MapObject | undefined> {
     layer: "back",
   };
   state.mapObjects.push(m);
-  state.selectedMap = m.id;
+  selectMap(m.id);
   markSceneDirty();
   return m;
 }
@@ -335,9 +385,6 @@ function drawTokenGlyph(t: Token): void {
   }
   ctx.restore();
   if (t.id === state.selectedToken) {
-    const fx = t.sx + Math.cos(t.facing) * (Math.max(t.r * state.camera.zoom, 10) + 9);
-    const fy = t.sy + Math.sin(t.facing) * (Math.max(t.r * state.camera.zoom, 10) + 9);
-    ctx.beginPath(); ctx.arc(fx, fy, 2.6, 0, Math.PI * 2); ctx.fillStyle = ACCENT; ctx.fill();
     if (t.light) {
       const lx = t.sx + t.lightOffset.dx * state.camera.zoom, ly = t.sy + t.lightOffset.dy * state.camera.zoom;
       const lfx = lx + Math.cos(t.lightFacing) * 16, lfy = ly + Math.sin(t.lightFacing) * 16;
@@ -618,7 +665,15 @@ requestRender();
 
 /* ================= interaction ================= */
 let dragging: Token | null = null, draggingMap: MapObject | null = null;
+let dragOffset: Vec2 = { x: 0, y: 0 }; // world-space cursor->center offset, preserved for the whole drag
+let dragMapOffset: Vec2 = { x: 0, y: 0 };
 let panStart: Vec2 | null = null, camStart: Camera | null = null;
+// Tracks whether a token or a map was selected more recently, so +/- (and
+// q/e/f/r) apply to whichever the person actually meant, instead of a token
+// selection from an earlier click always winning over the map now selected.
+let lastSelectedKind: "token" | "map" | null = null;
+function selectToken(id: string | null): void { state.selectedToken = id; if (id) lastSelectedKind = "token"; }
+function selectMap(id: string | null): void { state.selectedMap = id; if (id) lastSelectedKind = "map"; }
 
 function hitTestToken(mx: number, my: number): Token | null {
   for (let i = state.tokens.length - 1; i >= 0; i--) {
@@ -674,11 +729,11 @@ canvas.addEventListener("dblclick", e => {
   requestRender();
   const cw = innerWidth, ch = innerHeight;
   const hit = hitTestToken(e.clientX, e.clientY);
-  if (hit) { state.selectedToken = hit.id; openTokenMenu(hit, e.clientX, e.clientY); return; }
+  if (hit) { selectToken(hit.id); openTokenMenu(hit, e.clientX, e.clientY); return; }
   const lh = hitTestLight(e.clientX, e.clientY);
   if (lh) { openLightMenu(lh, e.clientX, e.clientY); return; }
   const mh = hitTestMap(e.clientX, e.clientY, cw, ch);
-  if (mh) { state.selectedMap = mh.id; openMapMenu(mh, e.clientX, e.clientY); return; }
+  if (mh) { selectMap(mh.id); openMapMenu(mh, e.clientX, e.clientY); return; }
   if (state.tool === "walls") {
     const wi = hitTestWallBody(e.clientX, e.clientY);
     if (wi != null) { pushUndo(); state.walls.splice(wi, 1); state.selectedWall = null; }
@@ -701,6 +756,13 @@ canvas.addEventListener("mousedown", e => {
     state.repositioning = null; canvas.classList.remove("reposition-mode"); return;
   }
   closeCtxMenu(); closePalette();
+  if (state.mergingToken) {
+    const hit = hitTestToken(e.clientX, e.clientY);
+    const first = state.tokens.find(x => x.id === state.mergingToken);
+    if (hit && first && hit.id !== first.id) { completeMergeToken(first, hit); return; }
+    state.mergingToken = null; canvas.classList.remove("merge-mode");
+    return;
+  }
   if (state.tool === "light") {
     const existing = hitTestLight(e.clientX, e.clientY);
     pushUndo();
@@ -720,19 +782,27 @@ canvas.addEventListener("mousedown", e => {
   }
   if (state.tool === "rotate") {
     const hit = hitTestToken(e.clientX, e.clientY);
-    if (hit && !hit.locked) { pushUndo(); state.selectedToken = hit.id; state.rotatingToken = hit; }
+    if (hit && !hit.locked) { pushUndo(); selectToken(hit.id); state.rotatingToken = hit; }
     return;
   }
   const hit = hitTestToken(e.clientX, e.clientY);
   if (hit && e.button === 0) {
-    state.selectedToken = hit.id;
-    if (!hit.locked) { pushUndo(); dragging = hit; canvas.classList.add("token-drag"); }
+    selectToken(hit.id);
+    if (!hit.locked) {
+      pushUndo(); dragging = hit; canvas.classList.add("token-drag");
+      const w = toWorld(e.clientX, e.clientY, cw, ch);
+      dragOffset = { x: hit.x - w.x, y: hit.y - w.y }; // keep the grabbed point under the cursor, no snap-to-center
+    }
     return;
   }
   const mapHit = hitTestMap(e.clientX, e.clientY, cw, ch);
   if (mapHit && e.button === 0) {
-    state.selectedMap = mapHit.id;
-    if (!mapHit.locked) { pushUndo(); draggingMap = mapHit; canvas.classList.add("token-drag"); }
+    selectMap(mapHit.id);
+    if (!mapHit.locked) {
+      pushUndo(); draggingMap = mapHit; canvas.classList.add("token-drag");
+      const w = toWorld(e.clientX, e.clientY, cw, ch);
+      dragMapOffset = { x: mapHit.x - w.x, y: mapHit.y - w.y };
+    }
     return;
   }
   panStart = { x: e.clientX, y: e.clientY }; camStart = { ...state.camera }; canvas.classList.add("panning");
@@ -749,8 +819,8 @@ addEventListener("mousemove", e => {
     return;
   }
   if (state.rotatingToken) { const t = state.rotatingToken; t.facing = t.facingTarget = Math.atan2(e.clientY - t.sy, e.clientX - t.sx); return; }
-  if (dragging) { const w = toWorld(e.clientX, e.clientY, cw, ch); dragging.x = snap(w.x); dragging.y = snap(w.y); return; }
-  if (draggingMap) { const w = toWorld(e.clientX, e.clientY, cw, ch); draggingMap.x = snap(w.x); draggingMap.y = snap(w.y); return; }
+  if (dragging) { const w = toWorld(e.clientX, e.clientY, cw, ch); dragging.x = snap(w.x + dragOffset.x); dragging.y = snap(w.y + dragOffset.y); return; }
+  if (draggingMap) { const w = toWorld(e.clientX, e.clientY, cw, ch); draggingMap.x = snap(w.x + dragMapOffset.x); draggingMap.y = snap(w.y + dragMapOffset.y); return; }
   if (panStart && camStart) {
     state.camera.x = camStart.x - (e.clientX - panStart.x) / state.camera.zoom;
     state.camera.y = camStart.y - (e.clientY - panStart.y) / state.camera.zoom;
@@ -773,7 +843,11 @@ canvas.addEventListener("wheel", e => {
 addEventListener("keydown", e => {
   requestRender();
   if (e.ctrlKey && (e.key === "z" || e.key === "Z")) { e.preventDefault(); doUndo(); return; }
-  if (e.key === "Escape") { state.wallDraft = null; state.repositioning = null; closeCtxMenu(); closePalette(); }
+  if (e.key === "Escape") {
+    state.wallDraft = null; state.repositioning = null;
+    if (state.mergingToken) { state.mergingToken = null; canvas.classList.remove("merge-mode"); }
+    closeCtxMenu(); closePalette();
+  }
   if (e.key === "Backspace") {
     if (state.selectedToken) { pushUndo(); state.tokens = state.tokens.filter(t => t.id !== state.selectedToken); state.selectedToken = null; closeCtxMenu(); return; }
     if (state.selectedWall != null) { pushUndo(); state.walls.splice(state.selectedWall, 1); state.selectedWall = null; if (state.openTab) renderPanel(); return; }
@@ -783,16 +857,25 @@ addEventListener("keydown", e => {
       return;
     }
   }
+  // Resize (+/-) targets whichever of token/map was most recently selected,
+  // not "token always wins" - a token being selected from an earlier click
+  // must not swallow +/- meant for a currently-selected map.
   const t = state.tokens.find(t => t.id === state.selectedToken);
-  if (t && !t.locked) {
+  const m = state.mapObjects.find(m => m.id === state.selectedMap);
+  const targetIsMap = !!m && lastSelectedKind === "map";
+  if (t && !t.locked && !targetIsMap) {
     if (e.key === "q" || e.key === "Q") { t.facingTarget -= Math.PI / 9; markSceneDirty(); return; }
     if (e.key === "e" || e.key === "E") { t.facingTarget += Math.PI / 9; markSceneDirty(); return; }
     if (e.key === "+" || e.key === "=") { t.r = Math.min(TOKEN_MAX_R, t.r + 4); markSceneDirty(); return; }
     if (e.key === "-" || e.key === "_") { t.r = Math.max(TOKEN_MIN_R, t.r - 4); markSceneDirty(); return; }
     if (e.key === "f" || e.key === "F") { t.flip = !t.flip; markSceneDirty(); return; }
+    if (t.states.length >= 2 && e.key >= "1" && e.key <= "9") {
+      const idx = +e.key - 1;
+      if (idx < t.states.length) { pushUndo(); setTokenState(t, idx); }
+      return;
+    }
     return;
   }
-  const m = state.mapObjects.find(m => m.id === state.selectedMap);
   if (m && !m.locked) {
     if (e.key === "q" || e.key === "Q") { m.rotationTarget -= Math.PI / 9; markSceneDirty(); }
     if (e.key === "r" || e.key === "R") { m.rotationTarget += Math.PI / 9; markSceneDirty(); }
@@ -812,6 +895,10 @@ const ICO2: Record<string, string> = {
   target: '<circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/>',
   front: '<path d="M12 19V5m0 0-4 4m4-4 4 4"/><path d="M5 20h14"/>',
   back: '<path d="M12 5v14m0 0-4-4m4 4 4-4"/><path d="M5 4h14"/>',
+  dup: '<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>',
+  merge: '<circle cx="7" cy="7" r="3"/><circle cx="17" cy="17" r="3"/><path d="M9.1 9.1l5.8 5.8"/>',
+  refresh: '<path d="M3 12a9 9 0 0 1 15.4-6.4L21 8M21 3v5h-5M21 12a9 9 0 0 1-15.4 6.4L3 16m0 5v-5h5"/>',
+  download: '<path d="M12 3v12m0 0-4-4m4 4 4-4"/><path d="M5 19h14"/>',
 };
 function ic2(n: string): string { return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">${ICO2[n]}</svg>`; }
 function positionMenu(x: number, y: number, h?: number): void {
@@ -822,13 +909,21 @@ function positionMenu(x: number, y: number, h?: number): void {
 function q<T extends HTMLElement>(sel: string): T { return ctxmenu.querySelector(sel) as T; }
 
 function openTokenMenu(t: Token, x: number, y: number): void {
+  const stateRow = t.states.length >= 2
+    ? `<div class="ctx-btns" id="cStates">${t.states.map((_, i) => `<div class="ctx-btn${i === t.activeState ? " active" : ""}" data-state="${i}">${i + 1}</div>`).join("")}</div>`
+    : "";
   ctxmenu.innerHTML = `
     <div class="ctx-btns">
-      <div class="ctx-btn" id="cRotL">${ic2("rot")}</div><div class="ctx-btn" id="cMinus">${ic2("minus")}</div>
-      <div class="ctx-btn" id="cPlus">${ic2("plus")}</div><div class="ctx-btn danger" id="cDel">${ic2("trash")}</div>
+      <div class="ctx-btn" id="cRotL" title="Rotate">${ic2("rot")}</div><div class="ctx-btn" id="cMinus" title="Smaller">${ic2("minus")}</div>
+      <div class="ctx-btn" id="cPlus" title="Bigger">${ic2("plus")}</div><div class="ctx-btn danger" id="cDel" title="Delete">${ic2("trash")}</div>
     </div>
-    <div class="ctx-btn ctx-wide" id="cLockBtn">${ic2(t.locked ? "unlock" : "lock")} ${t.locked ? "Unlock" : "Lock"} token</div>
-    <div class="ctx-btn ctx-wide" id="cReposition">${ic2("pin")} Reposition light</div>
+    <div class="ctx-btns">
+      <div class="ctx-btn" id="cLockBtn" title="${t.locked ? "Unlock" : "Lock"} token">${ic2(t.locked ? "unlock" : "lock")}</div>
+      <div class="ctx-btn" id="cDup" title="Duplicate">${ic2("dup")}</div>
+      <div class="ctx-btn" id="cMerge" title="Merge with another token">${ic2("merge")}</div>
+      <div class="ctx-btn" id="cReposition" title="Reposition light">${ic2("pin")}</div>
+    </div>
+    ${stateRow}
     <div class="ctx-btns">
       <div class="ctx-btn" id="cSendBack" title="Send to back layer">${ic2("back")}</div>
       <div class="ctx-btn" id="cBringFront" title="Bring to front layer">${ic2("front")}</div>
@@ -837,14 +932,16 @@ function openTokenMenu(t: Token, x: number, y: number): void {
     <div class="ctx-row"><span>Follow token facing</span><div class="switch ${t.followToken ? "on" : ""}" id="cFollow"></div></div>
     <div class="row" style="margin:6px 0 0;"><label><span>Cone</span>${numBox("cConeNum", 5, 360, t.cone)}</label><input type="range" id="cCone" min="5" max="360" value="${t.cone}"></div>
     <div class="row" style="margin:6px 0 0;" id="cLARow"><label><span>Light angle</span>${numBox("cLANum", -180, 180, Math.round(t.lightFacingTarget * 180 / Math.PI))}</label><input type="range" id="cLA" min="-180" max="180" value="${Math.round(t.lightFacingTarget * 180 / Math.PI)}" ${t.followToken ? "disabled" : ""}></div>
-    <div class="ctx-btn ctx-wide" id="cRecenter" style="margin-top:4px;">${ic2("target")} Recenter light</div>
+    <div class="ctx-btn" id="cRecenter" title="Recenter light" style="margin-top:4px; width:100%;">${ic2("target")}</div>
   `;
-  positionMenu(x, y, 360);
+  positionMenu(x, y, t.states.length >= 2 ? 400 : 360);
   q<HTMLElement>("#cRotL").onclick = () => { pushUndo(); t.facingTarget -= Math.PI / 6; };
   q<HTMLElement>("#cMinus").onclick = () => { pushUndo(); t.r = Math.max(TOKEN_MIN_R, t.r - 6); };
   q<HTMLElement>("#cPlus").onclick = () => { pushUndo(); t.r = Math.min(TOKEN_MAX_R, t.r + 6); };
   q<HTMLElement>("#cDel").onclick = () => { pushUndo(); state.tokens = state.tokens.filter(x => x.id !== t.id); closeCtxMenu(); };
   q<HTMLElement>("#cLockBtn").onclick = () => { pushUndo(); t.locked = !t.locked; openTokenMenu(t, x, y); };
+  q<HTMLElement>("#cDup").onclick = () => { const copy = duplicateToken(t); closeCtxMenu(); selectToken(copy.id); };
+  q<HTMLElement>("#cMerge").onclick = () => { beginMergeToken(t); closeCtxMenu(); };
   q<HTMLElement>("#cLight").onclick = e => { pushUndo(); t.light = !t.light; (e.target as HTMLElement).classList.toggle("on", t.light); };
   q<HTMLElement>("#cFollow").onclick = e => {
     pushUndo(); t.followToken = !t.followToken; (e.target as HTMLElement).classList.toggle("on", t.followToken);
@@ -857,6 +954,10 @@ function openTokenMenu(t: Token, x: number, y: number): void {
   q<HTMLElement>("#cRecenter").onclick = () => { pushUndo(); t.lightOffset = { dx: 0, dy: 0 }; t.lightFacingTarget = t.facingTarget; openTokenMenu(t, x, y); };
   q<HTMLElement>("#cSendBack").onclick = () => { pushUndo(); t.layer = "back"; openTokenMenu(t, x, y); };
   q<HTMLElement>("#cBringFront").onclick = () => { pushUndo(); t.layer = "front"; openTokenMenu(t, x, y); };
+  const statesEl = ctxmenu.querySelector("#cStates") as HTMLElement | null;
+  if (statesEl) statesEl.querySelectorAll("[data-state]").forEach(el => {
+    (el as HTMLElement).onclick = () => { pushUndo(); setTokenState(t, +(el as HTMLElement).dataset.state!); openTokenMenu(t, x, y); };
+  });
 }
 function openLightMenu(l: LightPoint, x: number, y: number): void {
   ctxmenu.innerHTML = `
@@ -864,7 +965,7 @@ function openLightMenu(l: LightPoint, x: number, y: number): void {
     <div class="row" style="margin:8px 0;"><label><span>Color</span><span></span></label><input type="color" id="lColor" value="${l.color || state.lightColor}"></div>
     <div class="row"><label><span>Intensity</span>${numBox("lIntNum", 10, 400, l.intensity ?? 100)}</label><input type="range" id="lInt" min="10" max="400" value="${l.intensity ?? 100}"></div>
     <div class="row"><label><span>Radius</span>${numBox("lRadNum", 20, 800, l.radius ?? 100)}</label><input type="range" id="lRad" min="20" max="800" value="${l.radius ?? 100}"></div>
-    <div class="ctx-btn danger ctx-wide" id="lDel">${ic2("trash")} Delete</div>
+    <div class="ctx-btn danger" id="lDel" title="Delete" style="width:100%; margin-top:2px;">${ic2("trash")}</div>
   `;
   positionMenu(x, y, 280);
   q<HTMLElement>("#lOn").onclick = e => { pushUndo(); l.on = !l.on; (e.target as HTMLElement).classList.toggle("on", l.on); };
@@ -876,11 +977,13 @@ function openLightMenu(l: LightPoint, x: number, y: number): void {
 function openMapMenu(m: MapObject, x: number, y: number): void {
   ctxmenu.innerHTML = `
     <div class="ctx-btns">
-      <div class="ctx-btn" id="mRotL">${ic2("rot")}</div><div class="ctx-btn" id="mMinus">${ic2("minus")}</div>
-      <div class="ctx-btn" id="mPlus">${ic2("plus")}</div><div class="ctx-btn danger" id="mDel">${ic2("trash")}</div>
+      <div class="ctx-btn" id="mRotL" title="Rotate">${ic2("rot")}</div><div class="ctx-btn" id="mMinus" title="Smaller">${ic2("minus")}</div>
+      <div class="ctx-btn" id="mPlus" title="Bigger">${ic2("plus")}</div><div class="ctx-btn danger" id="mDel" title="Delete">${ic2("trash")}</div>
     </div>
-    <div class="ctx-btn ctx-wide" id="mLock">${ic2(m.locked ? "unlock" : "lock")} ${m.locked ? "Unlock" : "Lock"} position</div>
-    <div class="ctx-btn ctx-wide" id="mLayer">${m.layer === "front" ? "Send to back layer" : "Bring to front layer"}</div>
+    <div class="ctx-btns">
+      <div class="ctx-btn" id="mLock" title="${m.locked ? "Unlock" : "Lock"} position">${ic2(m.locked ? "unlock" : "lock")}</div>
+      <div class="ctx-btn" id="mLayer" title="${m.layer === "front" ? "Send to back layer" : "Bring to front layer"}">${ic2(m.layer === "front" ? "back" : "front")}</div>
+    </div>
   `;
   positionMenu(x, y, 180);
   q<HTMLElement>("#mRotL").onclick = () => { pushUndo(); m.rotationTarget -= Math.PI / 9; };
@@ -1092,7 +1195,6 @@ function renderPanel(): void {
     const track = state.tracks[state.trackIndex];
     c.innerHTML = `
       <h2>Music</h2>
-      <div class="music-art" id="art" style="${track && track.cover ? `background-image:url(${track.cover})` : ""}"></div>
       <div class="music-title">${track ? escapeHtml(track.name) : "No track loaded"}</div>
       <div class="row"><input type="range" id="seek" min="0" max="100" value="0"></div>
       <div class="music-controls">
@@ -1133,6 +1235,13 @@ function renderPanel(): void {
       <div class="hairline"></div>
       <button class="btn" id="resetView">Reset camera</button>
       <button class="btn danger" id="wipeData">${icon("trash")} Clear local data</button>
+      <div class="hairline"></div>
+      <div class="toggle-row" style="justify-content:flex-start; gap:8px;">
+        <span style="flex:1;">${updateStatusLabel()}</span>
+        ${updateStatus === "available"
+          ? `<div class="ctx-btn" id="updInstall" title="Download and install update" style="flex:0 0 30px; width:30px; height:28px;">${ic2("download")}</div>`
+          : `<div class="ctx-btn" id="updCheck" title="Check for updates" style="flex:0 0 30px; width:30px; height:28px;">${ic2("refresh")}</div>`}
+      </div>
     `;
     if (!onDefault) {
       (c.querySelector("#campName") as HTMLInputElement).oninput = e => {
@@ -1157,6 +1266,20 @@ function renderPanel(): void {
     (c.querySelector("#importCamp") as HTMLElement).onclick = () => { void importCampaignFile(); };
     (c.querySelector("#resetView") as HTMLElement).onclick = () => { state.camera = { x: 0, y: 0, zoom: 1 }; };
     (c.querySelector("#wipeData") as HTMLElement).onclick = async () => { await invoke("clear_all_data"); location.reload(); };
+    const updCheck = c.querySelector("#updCheck") as HTMLElement | null;
+    if (updCheck) updCheck.onclick = () => { void checkForUpdates(false); };
+    const updInstall = c.querySelector("#updInstall") as HTMLElement | null;
+    if (updInstall) updInstall.onclick = () => { void installPendingUpdate(); };
+  }
+}
+function updateStatusLabel(): string {
+  switch (updateStatus) {
+    case "checking": return "Checking for updates…";
+    case "upToDate": return "You're on the latest version";
+    case "available": return `Update ${pendingUpdate?.version ?? ""} available`;
+    case "downloading": return "Installing update…";
+    case "error": return `Update check failed${updateError ? ": " + escapeHtml(updateError) : ""}`;
+    default: return "Check for updates";
   }
 }
 function currentCampaignName(): string {
@@ -1279,6 +1402,7 @@ function sceneSnapshot() {
       id: t.id, kind: t.kind, asset_id: t.assetId, x: t.x, y: t.y, r: t.r,
       facing: t.facing, light_facing: t.lightFacing, follow_token: t.followToken, cone: t.cone, light: t.light,
       light_offset: { x: t.lightOffset.dx, y: t.lightOffset.dy }, locked: t.locked, flip: t.flip, layer: t.layer,
+      states: t.states.map(s => ({ kind: s.kind, asset_id: s.assetId })), active_state: t.activeState,
     })),
     walls: state.walls.map(w => ({ a: { x: w.a.x, y: w.a.y }, b: { x: w.b.x, y: w.b.y } })),
     lights: state.lights.map(l => ({ id: l.id, x: l.x, y: l.y, on: l.on, color: l.color || state.lightColor, intensity: l.intensity ?? 100, radius: l.radius ?? 100 })),
@@ -1308,6 +1432,8 @@ function loadScene(scene: any): void {
     lightOffset: { dx: t.light_offset?.x ?? 0, dy: t.light_offset?.y ?? 0 },
     locked: !!t.locked, flip: !!t.flip, flipScale: t.flip ? -1 : 1,
     layer: t.layer === "back" || t.layer === "front" ? t.layer : "normal", sx: 0, sy: 0,
+    states: Array.isArray(t.states) ? t.states.map((s: any) => ({ kind: s.kind, assetId: s.asset_id })) : [],
+    activeState: t.active_state ?? 0,
   }));
   state.walls = (scene.walls || []).map((w: any): Wall => ({ a: { x: w.a.x, y: w.a.y }, b: { x: w.b.x, y: w.b.y } }));
   state.lights = (scene.lights || []).map((l: any): LightPoint => ({ id: l.id, x: l.x, y: l.y, on: l.on, color: l.color, intensity: l.intensity, radius: l.radius, sx: 0, sy: 0 }));
@@ -1317,6 +1443,7 @@ function loadScene(scene: any): void {
     layer: m.layer === "front" || m.layer === "normal" ? m.layer : "back",
   }));
   state.selectedToken = state.tokens[0] ? state.tokens[0].id : null;
+  lastSelectedKind = state.selectedToken ? "token" : null;
   state.selectedWall = null; state.selectedMap = null;
   undoStack = [];
   sceneDirty = false;
@@ -1381,6 +1508,49 @@ async function hydrateLibraryAssets(library: Library): Promise<void> {
   }
 }
 
+/* ================= automatic updates =================
+ * Tauri's updater plugin handles the actual download/verify/install; this
+ * just decides when to ask it and how to surface the result. Checking is
+ * cheap (one HTTPS request to the configured update manifest) so it's safe
+ * to do unconditionally on launch - the panel UI below is only for the
+ * "an update is ready, install now?" case, nothing polls or nags otherwise. */
+type UpdateStatus = "idle" | "checking" | "upToDate" | "available" | "downloading" | "error";
+let updateStatus: UpdateStatus = "idle";
+let updateError = "";
+let pendingUpdate: Awaited<ReturnType<typeof checkForUpdate>> | null = null;
+
+async function checkForUpdates(auto: boolean): Promise<void> {
+  updateStatus = "checking"; updateError = "";
+  if (state.openTab === "settings") renderPanel();
+  try {
+    const update = await checkForUpdate();
+    if (update) { pendingUpdate = update; updateStatus = "available"; }
+    else { pendingUpdate = null; updateStatus = "upToDate"; }
+  } catch (e) {
+    updateStatus = "error"; updateError = e instanceof Error ? e.message : String(e);
+    console.error("update check failed", e);
+  }
+  // An automatic (launch-time) check that finds nothing stays silent rather
+  // than popping the settings panel open; a manual check always shows its result.
+  if (!auto || updateStatus === "available" || updateStatus === "error") {
+    if (state.openTab === "settings") renderPanel();
+  }
+}
+async function installPendingUpdate(): Promise<void> {
+  if (!pendingUpdate) return;
+  updateStatus = "downloading";
+  if (state.openTab === "settings") renderPanel();
+  try {
+    await pendingUpdate.downloadAndInstall();
+    await saveCurrentScene(); // flush any pending edits before the relaunch
+    await relaunch();
+  } catch (e) {
+    updateStatus = "error"; updateError = e instanceof Error ? e.message : String(e);
+    console.error("update install failed", e);
+    if (state.openTab === "settings") renderPanel();
+  }
+}
+
 /* ================= load persisted data on launch ================= */
 (async () => {
   try {
@@ -1402,3 +1572,5 @@ async function hydrateLibraryAssets(library: Library): Promise<void> {
 addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden") void saveCurrentScene();
 });
+
+void checkForUpdates(true);

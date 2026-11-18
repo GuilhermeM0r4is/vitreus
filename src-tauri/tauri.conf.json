@@ -39,6 +39,15 @@
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/icon.icns"
-    ]
+    ],
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEIwNTdCQkNGRjQ3QTYxMTUKUldRVllYcjB6N3RYc0hObXZiUklqQTZmR2lpKytFK3JlUWNmTElxUnBNSDNkdHUxQjB3Y1U2dHYK%",
+      "endpoints": [
+        "https://github.com/GuilhermeM0r4is/vitreus/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

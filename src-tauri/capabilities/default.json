@@ -9,6 +9,8 @@
     "dialog:default",
     "dialog:allow-open",
     "dialog:allow-save",
-    "core:path:default"
+    "core:path:default",
+    "updater:default",
+    "process:default"
   ]
 }

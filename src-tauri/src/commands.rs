@@ -244,11 +244,16 @@ struct CampaignAsset {
 
 fn collect_campaign_assets(scene: &Scene, library: &Library, dir: &Path) -> Vec<CampaignAsset> {
     let mut assets = Vec::new();
-    for id in scene
-        .tokens
-        .iter()
-        .filter_map(|token| token.asset_id.as_ref())
-    {
+    // A merged token's own asset_id plus every state's asset_id (for a
+    // standard+alternate-pose pair, say) must all travel with the export,
+    // not just whichever state happens to be active right now.
+    let token_asset_ids = scene.tokens.iter().flat_map(|token| {
+        token
+            .asset_id
+            .iter()
+            .chain(token.states.iter().filter_map(|s| s.asset_id.as_ref()))
+    });
+    for id in token_asset_ids {
         if assets.iter().any(|asset: &CampaignAsset| asset.id == *id) {
             continue;
         }
@@ -459,6 +464,12 @@ pub fn import_campaign(state: State<Mutex<AppState>>, path: String) -> Result<Li
             .asset_id
             .as_ref()
             .and_then(|asset_id| remapped_ids.get(asset_id).cloned());
+        for s in &mut token.states {
+            s.asset_id = s
+                .asset_id
+                .as_ref()
+                .and_then(|asset_id| remapped_ids.get(asset_id).cloned());
+        }
     }
     package.scene.map_objects.retain_mut(|map| {
         if let Some(new_id) = remapped_ids.get(&map.asset_id) {

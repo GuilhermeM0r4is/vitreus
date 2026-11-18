@@ -18,6 +18,12 @@ pub struct Wall {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TokenState {
+    pub kind: String, // "circle" | "tri" | "img"
+    pub asset_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Token {
     pub id: String,
     pub kind: String, // "circle" | "tri" | "img"
@@ -35,6 +41,12 @@ pub struct Token {
     pub flip: bool,
     #[serde(default)]
     pub layer: RenderLayer,
+    /// Merged-token states, switchable in the UI with 1/2/.../9. Empty for
+    /// an ordinary, unmerged token.
+    #[serde(default)]
+    pub states: Vec<TokenState>,
+    #[serde(default)]
+    pub active_state: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
