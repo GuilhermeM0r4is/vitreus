@@ -249,13 +249,13 @@ function ensureMapImage(assetId: string): Promise<HTMLImageElement | null> {
   const asset = state.maps.find(item => item.id === assetId);
   return asset ? loadImage("map:" + assetId, asset.url) : Promise.resolve(null);
 }
-async function addMapObject(assetId: string): Promise<MapObject | undefined> {
+async function addMapObject(assetId: string, at: Vec2 = { x: state.camera.x, y: state.camera.y }): Promise<MapObject | undefined> {
   const image = await ensureMapImage(assetId);
   if (!image) return;
   const maxDim = 280;
   const scale = Math.min(maxDim / image.width, maxDim / image.height, 1);
   const m: MapObject = {
-    id: uid(), assetId, x: 0, y: 0,
+    id: uid(), assetId, x: at.x, y: at.y,
     w: image.width * scale, h: image.height * scale,
     rotation: 0, rotationTarget: 0, locked: false,
     layer: "back",
@@ -306,15 +306,18 @@ function worldSignature(sampleCount: number): number {
 }
 function clipToPoly(c: CanvasRenderingContext2D, poly: Vec2[], src: LightSource, originS: Vec2, cw: number, ch: number, baseRadius: number): boolean {
   if (poly.length < 3) return false;
+  // For a cone light, `poly` (whether it came from the Rust raycast or from
+  // fallbackLightPolygon) already includes the light's own position as the
+  // wedge's apex and is cut off exactly at the cone's edges - it's a
+  // complete, correct wedge on its own. An extra arc-shaped clip on top used
+  // to be layered here as a backstop, but it used a different radius and
+  // angle source than the real wall-aware polygon, and the two disagreeing
+  // approximations were what produced a boxy/rectangular look at narrow
+  // cone angles instead of a clean triangle. No second clip needed now.
+  void src; void originS; void baseRadius;
   c.beginPath();
   poly.forEach((p, i) => { const s = toScreen(p.x, p.y, cw, ch); if (i === 0) c.moveTo(s.x, s.y); else c.lineTo(s.x, s.y); });
   c.closePath(); c.clip();
-  if (src.cone < 359.5) {
-    const coneRad = Math.PI * 2 * (src.cone / 360);
-    c.beginPath(); c.moveTo(originS.x, originS.y);
-    c.arc(originS.x, originS.y, baseRadius * 2, src.facing - coneRad / 2, src.facing + coneRad / 2);
-    c.closePath(); c.clip();
-  }
   return true;
 }
 function revealFog(src: LightSource, poly: Vec2[], cw: number, ch: number): void {
@@ -833,10 +836,29 @@ addEventListener("mouseup", () => {
   requestRender();
 });
 canvas.addEventListener("contextmenu", e => e.preventDefault());
+// Lets a token/map be dragged straight off the asset grid and dropped at the
+// exact point on the board the person releases over, instead of spawning it
+// near the viewport center and then having to drag it into place by hand.
+canvas.addEventListener("dragover", e => {
+  if (e.dataTransfer?.types.includes("application/x-vitreus-token") || e.dataTransfer?.types.includes("application/x-vitreus-map")) {
+    e.preventDefault(); e.dataTransfer.dropEffect = "copy";
+  }
+});
+canvas.addEventListener("drop", e => {
+  const tokenAssetId = e.dataTransfer?.getData("application/x-vitreus-token");
+  const mapAssetId = e.dataTransfer?.getData("application/x-vitreus-map");
+  if (!tokenAssetId && !mapAssetId) return;
+  e.preventDefault();
+  const w = toWorld(e.clientX, e.clientY, innerWidth, innerHeight);
+  if (tokenAssetId) { pushUndo(); selectToken(addToken("img", snap(w.x), snap(w.y), tokenAssetId).id); }
+  else if (mapAssetId) { pushUndo(); void addMapObject(mapAssetId, { x: snap(w.x), y: snap(w.y) }); }
+});
 canvas.addEventListener("wheel", e => {
   e.preventDefault();
   const d = -e.deltaY * 0.001;
-  state.camera.zoom = Math.min(2.6, Math.max(0.4, state.camera.zoom * (1 + d)));
+  // Widened range: noticeably more room to zoom out (for seeing a whole big
+  // map at once) and a modest amount more zoom-in than before.
+  state.camera.zoom = Math.min(3.2, Math.max(0.12, state.camera.zoom * (1 + d)));
   useInteractiveLightingQuality();
   requestRender();
 }, { passive: false });
@@ -899,6 +921,12 @@ const ICO2: Record<string, string> = {
   merge: '<circle cx="7" cy="7" r="3"/><circle cx="17" cy="17" r="3"/><path d="M9.1 9.1l5.8 5.8"/>',
   refresh: '<path d="M3 12a9 9 0 0 1 15.4-6.4L21 8M21 3v5h-5M21 12a9 9 0 0 1-15.4 6.4L3 16m0 5v-5h5"/>',
   download: '<path d="M12 3v12m0 0-4-4m4 4 4-4"/><path d="M5 19h14"/>',
+  select: '<path d="M5 3l5.5 15 2-6.2L19 10z"/>',
+  wall: '<path d="M4 6h16M4 12h16M4 18h16"/>',
+  bulb: '<path d="M9 18h6M10 21h4"/><path d="M12 3a6 6 0 0 0-3.5 10.9c.6.4 1 1.1 1 1.9v.2h5v-.2c0-.8.4-1.5 1-1.9A6 6 0 0 0 12 3z"/>',
+  export: '<path d="M12 15V3m0 0-4 4m4-4 4 4"/><path d="M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/>',
+  import: '<path d="M12 3v12m0 0 4-4m-4 4-4-4"/><path d="M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/>',
+  camera: '<path d="M4 7h3l2-2h6l2 2h3a1 1 0 0 1 1 1v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a1 1 0 0 1 1-1z"/><circle cx="12" cy="13" r="3.4"/>',
 };
 function ic2(n: string): string { return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">${ICO2[n]}</svg>`; }
 function positionMenu(x: number, y: number, h?: number): void {
@@ -1111,15 +1139,19 @@ function renderPanel(): void {
   if (!state.openTab) return;
   const c = subpanel;
   if (state.openTab === "tools") {
+    const toolBtns: [string, string, string][] = [
+      ["select", "select", "Select"], ["rotate", "rot", "Rotate"],
+      ["walls", "wall", "Walls"], ["light", "bulb", "Light"],
+    ];
     c.innerHTML = `
       <h2>Tools</h2>
-      <div class="seg"><div data-t="select">Select</div><div data-t="rotate">Rotate</div><div data-t="walls">Walls</div><div data-t="light">Light</div></div>
-      ${state.tool === "walls" && state.selectedWall != null ? `<button class="btn danger" id="delWall">${icon("trash")} Delete selected wall</button>` : ""}
+      <div class="ctx-btns">${toolBtns.map(([t, ic, label]) =>
+        `<div class="ctx-btn${state.tool === t ? " active" : ""}" data-t="${t}" title="${label}">${ic2(ic)}</div>`).join("")}</div>
+      ${state.tool === "walls" && state.selectedWall != null ? `<div class="ctx-btn danger" id="delWall" title="Delete selected wall" style="width:100%; margin-bottom:5px;">${ic2("trash")}</div>` : ""}
       ${state.tool === "walls" ? `<div class="toggle-row" style="margin-top:4px;"><span>Snap to grid</span><div class="switch ${state.snap ? "on" : ""}" id="snapT"></div></div>` : ""}
     `;
-    c.querySelectorAll(".seg div").forEach(el => {
+    c.querySelectorAll("[data-t]").forEach(el => {
       const d = el as HTMLElement;
-      d.classList.toggle("active", state.tool === d.dataset.t);
       d.onclick = () => {
         state.tool = d.dataset.t!; state.wallDraft = null; state.selectedWall = null;
         canvas.className = "";
@@ -1163,7 +1195,9 @@ function renderPanel(): void {
       state.tokenAssets.filter(a => a.folderId === state.currentFolder).forEach(a => {
         const el = document.createElement("div"); el.className = "asset-item";
         const im = document.createElement("img"); im.src = a.url; el.appendChild(im);
-        el.onclick = () => addToken("img", (Math.random() - 0.5) * 160, (Math.random() - 0.5) * 160, a.id);
+        el.draggable = true;
+        el.onclick = () => addToken("img", state.camera.x + (Math.random() - 0.5) * 60, state.camera.y + (Math.random() - 0.5) * 60, a.id);
+        el.ondragstart = e => { e.dataTransfer?.setData("application/x-vitreus-token", a.id); e.dataTransfer!.effectAllowed = "copy"; };
         grid.appendChild(el);
       });
       body.appendChild(grid);
@@ -1184,7 +1218,9 @@ function renderPanel(): void {
       state.maps.filter(m => m.folderId === state.currentMapFolder).forEach(m => {
         const el = document.createElement("div"); el.className = "asset-item";
         const im = document.createElement("img"); im.src = m.url; el.appendChild(im);
+        el.draggable = true;
         el.onclick = () => { void addMapObject(m.id).then(() => renderPanel()); };
+        el.ondragstart = e => { e.dataTransfer?.setData("application/x-vitreus-map", m.id); e.dataTransfer!.effectAllowed = "copy"; };
         grid.appendChild(el);
       });
       body.appendChild(grid);
@@ -1229,11 +1265,12 @@ function renderPanel(): void {
       `}
       ${state.campaigns.length ? `<div class="row"><label><span>Switch campaign</span><span></span></label>
         <div id="campList" style="border:1px solid var(--border); border-radius:9px; overflow:hidden;">${state.campaigns.map(cp => `<div class="camp-item ${cp.id === state.currentCampaignId ? "active" : ""}" data-id="${cp.id}">${cp.id === state.currentCampaignId ? "● " : ""}${escapeHtml(cp.name)}</div>`).join("")}</div></div>` : ""}
-      <button class="btn" id="newCamp">${icon("plus")} New campaign</button>
-      <button class="btn" id="exportCamp">Export campaign</button>
-      <button class="btn" id="importCamp">Import campaign</button>
-      <div class="hairline"></div>
-      <button class="btn" id="resetView">Reset camera</button>
+      <div class="ctx-btns">
+        <div class="ctx-btn" id="newCamp" title="New campaign">${ic2("plus")}</div>
+        <div class="ctx-btn" id="exportCamp" title="Export campaign">${ic2("export")}</div>
+        <div class="ctx-btn" id="importCamp" title="Import campaign">${ic2("import")}</div>
+        <div class="ctx-btn" id="resetView" title="Reset camera">${ic2("camera")}</div>
+      </div>
       <button class="btn danger" id="wipeData">${icon("trash")} Clear local data</button>
       <div class="hairline"></div>
       <div class="toggle-row" style="justify-content:flex-start; gap:8px;">

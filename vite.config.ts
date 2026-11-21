@@ -10,7 +10,12 @@ export default defineConfig({
     watch: { ignored: ["**/src-tauri/**"] },
   },
   build: {
-    target: ["es2021", "chrome100", "safari14"],
+    // A single modern target (Tauri ships inside its own WebView, not an
+    // arbitrary browser, so there's no real cross-browser matrix to hit).
+    // The previous multi-target array (es2021 + chrome100 + safari14) made
+    // this esbuild/Vite combo choke specifically on destructuring syntax
+    // during minification - a single target avoids that reconciliation path.
+    target: "es2021",
     minify: "esbuild",
     sourcemap: false,
   },

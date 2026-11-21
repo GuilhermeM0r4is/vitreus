@@ -668,6 +668,16 @@ pub fn compute_visibility_batch(input: VisBatchInput) -> Vec<Vec<(f64, f64)>> {
         .lights
         .iter()
         .map(|lr| {
+            // The cone (when narrower than a full circle) is now passed
+            // straight into the raycast itself - see visibility_polygon's
+            // doc comment - rather than being filtered out of a full-circle
+            // polygon afterward, which is what produced a flat-fronted,
+            // boxy shape instead of a clean triangle at narrow angles.
+            let cone = if lr.cone < 359.5 {
+                Some((lr.facing, lr.cone))
+            } else {
+                None
+            };
             let poly = lighting::visibility_polygon(
                 lr.ox,
                 lr.oy,
@@ -675,12 +685,8 @@ pub fn compute_visibility_batch(input: VisBatchInput) -> Vec<Vec<(f64, f64)>> {
                 &walls,
                 &wall_intersections,
                 input.sample_count,
+                cone,
             );
-            let poly = if lr.cone < 359.5 {
-                lighting::clip_to_cone(&poly, lr.ox, lr.oy, lr.facing, lr.cone)
-            } else {
-                poly
-            };
             poly.into_iter().map(|p| (p.x, p.y)).collect()
         })
         .collect()
