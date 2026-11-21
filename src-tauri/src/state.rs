@@ -37,6 +37,14 @@ pub struct Token {
     pub cone: f64,
     pub light: bool,
     pub light_offset: Point,
+    /// The token's own lantern strength, matching the sliders a standalone
+    /// LightPoint already exposes. Defaulted for saves made before this was
+    /// added (full-strength intensity, 100-unit radius, same as a token's
+    /// built-in light always had implicitly).
+    #[serde(default = "default_light_intensity")]
+    pub light_intensity: f64,
+    #[serde(default = "default_light_radius")]
+    pub light_radius: f64,
     pub locked: bool,
     pub flip: bool,
     #[serde(default)]
@@ -92,6 +100,14 @@ fn default_map_layer() -> RenderLayer {
     RenderLayer::Back
 }
 
+fn default_light_intensity() -> f64 {
+    100.0
+}
+
+fn default_light_radius() -> f64 {
+    100.0
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct Scene {
     pub tokens: Vec<Token>,
@@ -125,6 +141,11 @@ pub struct Library {
     pub token_assets: HashMap<String, (String, String)>,
     pub map_assets: HashMap<String, (String, String)>,
     pub tracks: Vec<(String, String)>, // (id, file name)
+    /// Images added to the document sheet tab - a flat list like `tracks`
+    /// rather than a folder map like the token/map assets, since documents
+    /// aren't organized into folders.
+    #[serde(default)]
+    pub documents: Vec<(String, String)>, // (id, file name)
 }
 
 impl Default for AssetFolder {

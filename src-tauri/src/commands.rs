@@ -61,7 +61,7 @@ fn valid_asset_id(value: &str) -> bool {
 fn valid_extension(kind: &str, extension: &str) -> bool {
     let extension = extension.to_ascii_lowercase();
     match kind {
-        "token" | "map" => matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "webp"),
+        "token" | "map" | "document" => matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "webp"),
         "audio" => matches!(extension.as_str(), "mp3" | "wav" | "ogg" | "m4a"),
         _ => false,
     }
@@ -83,7 +83,7 @@ fn copy_or_downscale_image(
     if u64::from(width) * u64::from(height) > MAX_SOURCE_PIXELS {
         return Err("Image dimensions are too large".into());
     }
-    let edge_limit = if kind == "map" {
+    let edge_limit = if kind == "map" || kind == "document" {
         MAX_MAP_EDGE
     } else {
         MAX_TOKEN_EDGE
@@ -519,7 +519,7 @@ pub fn import_asset(
     let dir = state.lock().unwrap().data_dir.clone();
     let adir = assets_dir(&dir);
     fs::create_dir_all(&adir).map_err(|e| e.to_string())?;
-    if !matches!(kind.as_str(), "token" | "map" | "audio") {
+    if !matches!(kind.as_str(), "token" | "map" | "audio" | "document") {
         return Err("Unsupported asset type".into());
     }
     let src = PathBuf::from(&source_path)
@@ -547,6 +547,9 @@ pub fn import_asset(
     if kind == "audio" {
         fs::copy(&src, &dest).map_err(|e| e.to_string())?;
     } else {
+        // "document" shares the image pipeline (and the map-sized edge
+        // limit set above) with "token"/"map" - it's just not tied to a
+        // folder or to any scene object the way those two are.
         if let Err(error) = copy_or_downscale_image(&src, &dest, &kind, &ext) {
             let _ = fs::remove_file(&dest);
             return Err(error);
@@ -570,6 +573,9 @@ pub fn import_asset(
         "audio" => {
             lib.tracks.push((id.clone(), name.clone()));
         }
+        "document" => {
+            lib.documents.push((id.clone(), name.clone()));
+        }
         _ => {}
     }
     if let Err(error) = save_library(&dir, &lib) {
@@ -590,7 +596,9 @@ pub fn asset_path(
     ext: String,
 ) -> Result<String, String> {
     let dir = state.lock().unwrap().data_dir.clone();
-    if !valid_asset_id(&id) || !valid_extension("token", &ext) && !valid_extension("audio", &ext) {
+    if !valid_asset_id(&id)
+        || !valid_extension("token", &ext) && !valid_extension("audio", &ext) && !valid_extension("document", &ext)
+    {
         return Err("Invalid asset path request".into());
     }
     let library = load_library(&dir);
@@ -602,6 +610,13 @@ pub fn asset_path(
         .or_else(|| {
             library
                 .tracks
+                .iter()
+                .find(|(asset_id, _)| asset_id == &id)
+                .map(|(_, name)| name)
+        })
+        .or_else(|| {
+            library
+                .documents
                 .iter()
                 .find(|(asset_id, _)| asset_id == &id)
                 .map(|(_, name)| name)

@@ -94,6 +94,16 @@ input[type="text"]{width:100%; background:rgba(255,255,255,0.06); border:1px sol
 .camp-item{padding:8px 10px; font-size:12.5px; cursor:pointer; color:var(--text);}
 .camp-item:hover{background:rgba(255,255,255,0.07);} .camp-item.active{color:var(--accent);}
 
+#docViewer{position:fixed; top:0; right:0; bottom:0; width:min(46vw, 560px); background:var(--panel); border-left:1px solid var(--border);
+  backdrop-filter:blur(26px); -webkit-backdrop-filter:blur(26px); box-shadow:-14px 0 40px rgba(0,0,0,.5); z-index:45;
+  display:flex; flex-direction:column; transform:translateX(100%); transition:transform .22s cubic-bezier(.2,.8,.2,1);
+  padding-top:env(safe-area-inset-top,0px); padding-bottom:env(safe-area-inset-bottom,0px);}
+#docViewer.open{transform:translateX(0);}
+#docViewerBar{display:flex; justify-content:flex-end; gap:6px; padding:10px;}
+#docViewerBar .ctx-btn{width:30px; height:30px; flex:0 0 30px;}
+#docViewerBody{flex:1; overflow:auto; display:flex; align-items:flex-start; justify-content:center; padding:0 14px 14px;}
+#docViewerImg{max-width:none; transform-origin:top center; border-radius:8px; box-shadow:0 10px 30px rgba(0,0,0,.4);}
+
 #modalOverlay{position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:80; display:flex; align-items:center; justify-content:center;}
 #modalBox{background:var(--panel); border:1px solid var(--border); border-radius:14px; padding:16px; width:230px; backdrop-filter:blur(26px); -webkit-backdrop-filter:blur(26px);}
 #modalBox .mt{font-size:12.5px; color:var(--text-dim); margin-bottom:9px;}

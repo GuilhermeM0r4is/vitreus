@@ -6,7 +6,22 @@ import { relaunch } from "@tauri-apps/plugin-process";
 
 /* ================= domain model ================= */
 interface Vec2 { x: number; y: number; }
+/** A token's light position relative to its own body, stored in the token's
+ * *local* frame (as if the token were facing angle 0) rather than in raw
+ * world-space dx/dy. Rotating it by the token's current `facing` (see
+ * localOffsetToWorld) is what keeps the light glued to the same spot on the
+ * token - e.g. "in its hand" - as the token turns, instead of staying
+ * pinned to a fixed world direction while the token's art spins under it. */
 interface LightOffset { dx: number; dy: number; }
+function localOffsetToWorld(o: LightOffset, facing: number): LightOffset {
+  const c = Math.cos(facing), s = Math.sin(facing);
+  return { dx: o.dx * c - o.dy * s, dy: o.dx * s + o.dy * c };
+}
+function worldOffsetToLocal(o: LightOffset, facing: number): LightOffset {
+  const c = Math.cos(facing), s = Math.sin(facing);
+  // Inverse rotation (rotate by -facing): same matrix, transposed.
+  return { dx: o.dx * c + o.dy * s, dy: -o.dx * s + o.dy * c };
+}
 interface Camera { x: number; y: number; zoom: number; }
 
 interface TokenState { kind: string; assetId: string | null; }
@@ -16,6 +31,7 @@ interface Token {
   facing: number; facingTarget: number;
   lightFacing: number; lightFacingTarget: number; followToken: boolean;
   cone: number; light: boolean; lightOffset: LightOffset;
+  lightIntensity: number; lightRadius: number;
   locked: boolean; flip: boolean; flipScale: number;
   layer: "back" | "normal" | "front";
   sx: number; sy: number;
@@ -38,6 +54,7 @@ interface AssetFolder { id: string; color: string; }
 interface TokenAsset { id: string; name: string; folderId: string; url: string; }
 interface MapAsset { id: string; name: string; folderId: string; url: string; }
 interface Track { id: string; name: string; url: string; cover: string | null; }
+interface DocumentImage { id: string; name: string; url: string; }
 interface Campaign { id: string; name: string; }
 interface WallHandle { wall: Wall; idx: number; end: "a" | "b"; }
 /** What gets fed into the renderer per frame for each light-emitting thing (token or torch). */
@@ -52,7 +69,7 @@ interface AppState {
   camera: Camera;
   tokens: Token[]; walls: Wall[]; lights: LightPoint[]; mapObjects: MapObject[];
   wallDraft: Vec2 | null; wallDraftCursor: Vec2 | null;
-  selectedToken: string | null; selectedWall: number | null; selectedMap: string | null;
+  selectedToken: string | null; selectedWall: number | null; selectedMap: string | null; selectedLight: string | null;
   draggingWallHandle: WallHandle | null; rotatingToken: Token | null; repositioning: string | null;
   mergingToken: string | null;
   maps: MapAsset[];
@@ -61,6 +78,7 @@ interface AppState {
   tokenAssets: TokenAsset[]; assetImages: Record<string, HTMLImageElement>;
   tracks: Track[]; trackIndex: number; audioEl: HTMLAudioElement; audioAltEl: HTMLAudioElement;
   campaigns: Campaign[]; currentCampaignId: string | null; tokensSub: string;
+  documents: DocumentImage[]; openDocument: string | null; documentZoom: number;
 }
 
 const imageLoads: Record<string, Promise<HTMLImageElement | null> | undefined> = {};
@@ -80,7 +98,7 @@ const state: AppState = {
   camera: { x: 0, y: 0, zoom: 1 },
   tokens: [], walls: [], lights: [], mapObjects: [],
   wallDraft: null, wallDraftCursor: null,
-  selectedToken: null, selectedWall: null, selectedMap: null,
+  selectedToken: null, selectedWall: null, selectedMap: null, selectedLight: null,
   draggingWallHandle: null, rotatingToken: null, repositioning: null,
   mergingToken: null,
   maps: [],
@@ -89,6 +107,7 @@ const state: AppState = {
   tokenAssets: [], assetImages: {},
   tracks: [], trackIndex: -1, audioEl: new Audio(), audioAltEl: new Audio(),
   campaigns: [], currentCampaignId: null, tokensSub: "tokens",
+  documents: [], openDocument: null, documentZoom: 1,
 };
 
 /* ================= undo ================= */
@@ -177,6 +196,7 @@ function addToken(kind: string, x: number, y: number, assetId: string | null = n
     facing: -Math.PI / 2, facingTarget: -Math.PI / 2,
     lightFacing: -Math.PI / 2, lightFacingTarget: -Math.PI / 2, followToken: true,
     cone: 40, light: true, lightOffset: { dx: 0, dy: 0 },
+    lightIntensity: 100, lightRadius: 100,
     locked: false, flip: false, flipScale: 1, sx: 0, sy: 0,
     layer: "normal", states: [], activeState: 0,
   };
@@ -299,7 +319,7 @@ function worldSignature(sampleCount: number): number {
   const mix = (v: number) => { h = (Math.imul(h ^ (v * 1000 | 0), 16777619)) | 0; };
   mix(state.camera.zoom);
   mix(sampleCount);
-  for (const t of state.tokens) if (t.light) { mix(t.x); mix(t.y); mix(t.lightFacing); mix(t.cone); mix(t.lightOffset.dx); mix(t.lightOffset.dy); }
+  for (const t of state.tokens) if (t.light) { mix(t.x); mix(t.y); mix(t.facing); mix(t.lightFacing); mix(t.cone); mix(t.lightOffset.dx); mix(t.lightOffset.dy); mix(t.lightRadius ?? 100); }
   for (const l of state.lights) if (l.on) { mix(l.x); mix(l.y); mix(l.radius); }
   for (const w of state.walls) { mix(w.a.x); mix(w.a.y); mix(w.b.x); mix(w.b.y); }
   return h;
@@ -389,7 +409,8 @@ function drawTokenGlyph(t: Token): void {
   ctx.restore();
   if (t.id === state.selectedToken) {
     if (t.light) {
-      const lx = t.sx + t.lightOffset.dx * state.camera.zoom, ly = t.sy + t.lightOffset.dy * state.camera.zoom;
+      const worldOff = localOffsetToWorld(t.lightOffset, t.facing);
+      const lx = t.sx + worldOff.dx * state.camera.zoom, ly = t.sy + worldOff.dy * state.camera.zoom;
       const lfx = lx + Math.cos(t.lightFacing) * 16, lfy = ly + Math.sin(t.lightFacing) * 16;
       ctx.beginPath(); ctx.moveTo(lx, ly); ctx.lineTo(lfx, lfy); ctx.strokeStyle = "#ffd98a"; ctx.lineWidth = 1.5; ctx.stroke();
       ctx.beginPath(); ctx.arc(lx, ly, 3, 0, Math.PI * 2); ctx.strokeStyle = "#ffd98a"; ctx.lineWidth = 1.5; ctx.stroke();
@@ -397,7 +418,14 @@ function drawTokenGlyph(t: Token): void {
   }
 }
 function drawTorchGlyph(l: LightPoint): void {
+  // Dimmed by default so the editing marker doesn't give away a light's
+  // exact position at a glance - it's still findable (a faint dot, not
+  // invisible), just no longer as obvious as the full-strength fill used to
+  // make it. Brightens back to full opacity while its own menu is open,
+  // i.e. while it's actually being worked on.
+  const selected = l.id === state.selectedLight;
   ctx.save(); ctx.translate(l.sx, l.sy);
+  ctx.globalAlpha = selected ? 1 : 0.35;
   ctx.fillStyle = l.color || state.lightColor;
   ctx.beginPath(); ctx.arc(0, 0, 7 * state.camera.zoom, 0, Math.PI * 2); ctx.fill();
   ctx.strokeStyle = "rgba(0,0,0,0.5)"; ctx.lineWidth = 1.5; ctx.stroke();
@@ -585,6 +613,14 @@ function render(): void {
       t.facing = lerpAngle(t.facing, t.facingTarget, ROT_LERP);
       animationActive = true;
     } else t.facing = t.facingTarget;
+    // Following is continuous *tracking*, not a one-time snap: while it's on,
+    // the light's target keeps up with wherever the token is turning, each
+    // frame, exactly as before. The bug was that this ran even while follow
+    // was off (see the toggle handler), silently overwriting a manually-set
+    // angle the instant follow got switched back on. With follow off, this
+    // line simply does nothing, so lightFacingTarget keeps whatever value
+    // was last set by hand (by the angle slider) until the person either
+    // turns follow back on or changes it again themselves.
     if (t.followToken) t.lightFacingTarget = t.facingTarget;
     if (Math.abs(lerpAngle(t.lightFacing, t.lightFacingTarget, 1) - t.lightFacing) > 0.0005) {
       t.lightFacing = lerpAngle(t.lightFacing, t.lightFacingTarget, ROT_LERP);
@@ -597,9 +633,10 @@ function render(): void {
     } else t.flipScale = flipTarget;
     const p = toScreen(t.x, t.y, cw, ch); t.sx = p.x; t.sy = p.y;
     if (t.light) {
+      const worldOff = localOffsetToWorld(t.lightOffset, t.facing);
       activeLights.push({
-        x: t.x + t.lightOffset.dx, y: t.y + t.lightOffset.dy, facing: t.lightFacing,
-        cone: t.cone, color: state.lightColor, intensity: 100, radius: 100, flicker: 1,
+        x: t.x + worldOff.dx, y: t.y + worldOff.dy, facing: t.lightFacing,
+        cone: t.cone, color: state.lightColor, intensity: t.lightIntensity ?? 100, radius: t.lightRadius ?? 100, flicker: 1,
       });
     }
   }
@@ -754,7 +791,10 @@ canvas.addEventListener("mousedown", e => {
       let dx = w.x - t.x, dy = w.y - t.y;
       const dist = Math.hypot(dx, dy);
       if (dist > t.r) { dx = dx / dist * t.r; dy = dy / dist * t.r; }
-      pushUndo(); t.lightOffset = { dx, dy };
+      // Store relative to the token's *current* facing so the click position
+      // (e.g. "in its hand") is remembered in the token's own body frame,
+      // not as a fixed world direction - see localOffsetToWorld.
+      pushUndo(); t.lightOffset = worldOffsetToLocal({ dx, dy }, t.facing);
     }
     state.repositioning = null; canvas.classList.remove("reposition-mode"); return;
   }
@@ -868,6 +908,7 @@ addEventListener("keydown", e => {
   if (e.key === "Escape") {
     state.wallDraft = null; state.repositioning = null;
     if (state.mergingToken) { state.mergingToken = null; canvas.classList.remove("merge-mode"); }
+    if (state.openDocument) closeDocumentViewer();
     closeCtxMenu(); closePalette();
   }
   if (e.key === "Backspace") {
@@ -927,6 +968,7 @@ const ICO2: Record<string, string> = {
   export: '<path d="M12 15V3m0 0-4 4m4-4 4 4"/><path d="M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/>',
   import: '<path d="M12 3v12m0 0 4-4m-4 4-4-4"/><path d="M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/>',
   camera: '<path d="M4 7h3l2-2h6l2 2h3a1 1 0 0 1 1 1v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a1 1 0 0 1 1-1z"/><circle cx="12" cy="13" r="3.4"/>',
+  close: '<path d="M6 6l12 12M18 6 6 18"/>',
 };
 function ic2(n: string): string { return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">${ICO2[n]}</svg>`; }
 function positionMenu(x: number, y: number, h?: number): void {
@@ -960,9 +1002,11 @@ function openTokenMenu(t: Token, x: number, y: number): void {
     <div class="ctx-row"><span>Follow token facing</span><div class="switch ${t.followToken ? "on" : ""}" id="cFollow"></div></div>
     <div class="row" style="margin:6px 0 0;"><label><span>Cone</span>${numBox("cConeNum", 5, 360, t.cone)}</label><input type="range" id="cCone" min="5" max="360" value="${t.cone}"></div>
     <div class="row" style="margin:6px 0 0;" id="cLARow"><label><span>Light angle</span>${numBox("cLANum", -180, 180, Math.round(t.lightFacingTarget * 180 / Math.PI))}</label><input type="range" id="cLA" min="-180" max="180" value="${Math.round(t.lightFacingTarget * 180 / Math.PI)}" ${t.followToken ? "disabled" : ""}></div>
+    <div class="row" style="margin:6px 0 0;"><label><span>Intensity</span>${numBox("cIntNum", 10, 400, t.lightIntensity ?? 100)}</label><input type="range" id="cInt" min="10" max="400" value="${t.lightIntensity ?? 100}"></div>
+    <div class="row" style="margin:6px 0 0;"><label><span>Radius</span>${numBox("cRadNum", 20, 800, t.lightRadius ?? 100)}</label><input type="range" id="cRad" min="20" max="800" value="${t.lightRadius ?? 100}"></div>
     <div class="ctx-btn" id="cRecenter" title="Recenter light" style="margin-top:4px; width:100%;">${ic2("target")}</div>
   `;
-  positionMenu(x, y, t.states.length >= 2 ? 400 : 360);
+  positionMenu(x, y, t.states.length >= 2 ? 480 : 440);
   q<HTMLElement>("#cRotL").onclick = () => { pushUndo(); t.facingTarget -= Math.PI / 6; };
   q<HTMLElement>("#cMinus").onclick = () => { pushUndo(); t.r = Math.max(TOKEN_MIN_R, t.r - 6); };
   q<HTMLElement>("#cPlus").onclick = () => { pushUndo(); t.r = Math.min(TOKEN_MAX_R, t.r + 6); };
@@ -973,11 +1017,15 @@ function openTokenMenu(t: Token, x: number, y: number): void {
   q<HTMLElement>("#cLight").onclick = e => { pushUndo(); t.light = !t.light; (e.target as HTMLElement).classList.toggle("on", t.light); };
   q<HTMLElement>("#cFollow").onclick = e => {
     pushUndo(); t.followToken = !t.followToken; (e.target as HTMLElement).classList.toggle("on", t.followToken);
-    if (t.followToken) t.lightFacingTarget = t.facingTarget;
+    // No forced re-sync here: turning follow back on should resume tracking
+    // from whatever angle the light is currently at (manually set while
+    // follow was off), not snap it back to the token's body facing first.
     openTokenMenu(t, x, y);
   };
   syncRangeNum(q("#cCone"), q("#cConeNum"), v => { t.cone = v; markSceneDirty(); });
   syncRangeNum(q("#cLA"), q("#cLANum"), v => { t.lightFacingTarget = v * Math.PI / 180; markSceneDirty(); });
+  syncRangeNum(q("#cInt"), q("#cIntNum"), v => { t.lightIntensity = v; markSceneDirty(); });
+  syncRangeNum(q("#cRad"), q("#cRadNum"), v => { t.lightRadius = v; markSceneDirty(); });
   q<HTMLElement>("#cReposition").onclick = () => { state.repositioning = t.id; canvas.classList.add("reposition-mode"); closeCtxMenu(); };
   q<HTMLElement>("#cRecenter").onclick = () => { pushUndo(); t.lightOffset = { dx: 0, dy: 0 }; t.lightFacingTarget = t.facingTarget; openTokenMenu(t, x, y); };
   q<HTMLElement>("#cSendBack").onclick = () => { pushUndo(); t.layer = "back"; openTokenMenu(t, x, y); };
@@ -988,6 +1036,7 @@ function openTokenMenu(t: Token, x: number, y: number): void {
   });
 }
 function openLightMenu(l: LightPoint, x: number, y: number): void {
+  state.selectedLight = l.id;
   ctxmenu.innerHTML = `
     <div class="ctx-row"><span>On</span><div class="switch ${l.on ? "on" : ""}" id="lOn"></div></div>
     <div class="row" style="margin:8px 0;"><label><span>Color</span><span></span></label><input type="color" id="lColor" value="${l.color || state.lightColor}"></div>
@@ -1021,7 +1070,7 @@ function openMapMenu(m: MapObject, x: number, y: number): void {
   q<HTMLElement>("#mLock").onclick = () => { pushUndo(); m.locked = !m.locked; openMapMenu(m, x, y); };
   q<HTMLElement>("#mLayer").onclick = () => { pushUndo(); m.layer = m.layer === "front" ? "back" : "front"; openMapMenu(m, x, y); };
 }
-function closeCtxMenu(): void { ctxmenu.classList.remove("open"); }
+function closeCtxMenu(): void { ctxmenu.classList.remove("open"); state.selectedLight = null; }
 addEventListener("mousedown", e => {
   if (ctxmenu.classList.contains("open") && !ctxmenu.contains(e.target as Node) && e.target !== canvas) closeCtxMenu();
 }, true);
@@ -1254,6 +1303,21 @@ function renderPanel(): void {
     const seek = c.querySelector("#seek") as HTMLInputElement;
     seek.oninput = e => { if (state.audioEl.duration) state.audioEl.currentTime = (+(e.target as HTMLInputElement).value / 100) * state.audioEl.duration; };
     state.audioEl.ontimeupdate = () => { if (state.audioEl.duration) seek.value = String((state.audioEl.currentTime / state.audioEl.duration) * 100); };
+  } else if (state.openTab === "documents") {
+    c.innerHTML = `
+      <h2>Documents</h2>
+      <div class="asset-grid" id="docGrid"></div>
+    `;
+    const grid = c.querySelector("#docGrid") as HTMLElement;
+    state.documents.forEach(d => {
+      const el = document.createElement("div"); el.className = "asset-item"; el.title = d.name;
+      const img = document.createElement("img"); img.src = d.url; img.loading = "lazy"; el.appendChild(img);
+      el.onclick = () => openDocumentViewer(d.id);
+      grid.appendChild(el);
+    });
+    const addEl = document.createElement("div"); addEl.className = "folder-add"; addEl.title = "Import images";
+    addEl.innerHTML = icon("plus"); addEl.onclick = importDocumentImages;
+    grid.appendChild(addEl);
   } else if (state.openTab === "settings") {
     const onDefault = !state.currentCampaignId;
     c.innerHTML = `
@@ -1421,6 +1485,42 @@ async function importAudioTracks(): Promise<void> {
   }
   if (state.trackIndex === -1 && state.tracks.length) playTrack(0); else renderPanel();
 }
+/* ================= document sheet viewer (side panel) ================= */
+const docViewer = document.getElementById("docViewer") as HTMLElement;
+const docViewerImg = document.getElementById("docViewerImg") as HTMLImageElement;
+const DOC_ZOOM_MIN = 0.25, DOC_ZOOM_MAX = 4;
+function openDocumentViewer(id: string): void {
+  const doc = state.documents.find(d => d.id === id);
+  if (!doc) return;
+  state.openDocument = id; state.documentZoom = 1;
+  docViewerImg.src = doc.url;
+  docViewerImg.style.transform = "scale(1)";
+  docViewer.classList.add("open");
+}
+function closeDocumentViewer(): void {
+  state.openDocument = null;
+  docViewer.classList.remove("open");
+}
+function setDocumentZoom(z: number): void {
+  state.documentZoom = Math.min(DOC_ZOOM_MAX, Math.max(DOC_ZOOM_MIN, z));
+  docViewerImg.style.transform = `scale(${state.documentZoom})`;
+}
+(document.getElementById("docZoomIn") as HTMLElement).innerHTML = ic2("plus");
+(document.getElementById("docZoomOut") as HTMLElement).innerHTML = ic2("minus");
+(document.getElementById("docClose") as HTMLElement).innerHTML = ic2("close");
+(document.getElementById("docZoomIn") as HTMLElement).onclick = () => setDocumentZoom(state.documentZoom + 0.25);
+(document.getElementById("docZoomOut") as HTMLElement).onclick = () => setDocumentZoom(state.documentZoom - 0.25);
+(document.getElementById("docClose") as HTMLElement).onclick = closeDocumentViewer;
+
+async function importDocumentImages(): Promise<void> {
+  const paths = await pickFiles([{ name: "Image", extensions: ["png", "jpg", "jpeg", "webp"] }], true);
+  for (const p of paths) {
+    const asset = await invoke<ImportedAsset>("import_asset", { sourcePath: p, kind: "document", folderId: null });
+    const url = convertFileSrc(await invoke<string>("asset_path", { id: asset.id, ext: asset.ext }));
+    state.documents.push({ id: asset.id, name: asset.name, url });
+  }
+  renderPanel();
+}
 
 /* ================= campaigns (persisted natively by Rust, see commands.rs) ================= */
 interface Library {
@@ -1431,6 +1531,7 @@ interface Library {
   token_assets: Record<string, [string, string]>;
   map_assets: Record<string, [string, string]>;
   tracks: [string, string][];
+  documents: [string, string][];
 }
 function sceneSnapshot() {
   // snake_case keys to match the Rust Scene/Token/etc structs directly (serde).
@@ -1438,7 +1539,9 @@ function sceneSnapshot() {
     tokens: state.tokens.map(t => ({
       id: t.id, kind: t.kind, asset_id: t.assetId, x: t.x, y: t.y, r: t.r,
       facing: t.facing, light_facing: t.lightFacing, follow_token: t.followToken, cone: t.cone, light: t.light,
-      light_offset: { x: t.lightOffset.dx, y: t.lightOffset.dy }, locked: t.locked, flip: t.flip, layer: t.layer,
+      light_offset: { x: t.lightOffset.dx, y: t.lightOffset.dy },
+      light_intensity: t.lightIntensity ?? 100, light_radius: t.lightRadius ?? 100,
+      locked: t.locked, flip: t.flip, layer: t.layer,
       states: t.states.map(s => ({ kind: s.kind, asset_id: s.assetId })), active_state: t.activeState,
     })),
     walls: state.walls.map(w => ({ a: { x: w.a.x, y: w.a.y }, b: { x: w.b.x, y: w.b.y } })),
@@ -1467,6 +1570,7 @@ function loadScene(scene: any): void {
     lightFacing: t.light_facing ?? t.facing, lightFacingTarget: t.light_facing ?? t.facing,
     followToken: t.follow_token !== false, cone: t.cone, light: t.light,
     lightOffset: { dx: t.light_offset?.x ?? 0, dy: t.light_offset?.y ?? 0 },
+    lightIntensity: t.light_intensity ?? 100, lightRadius: t.light_radius ?? 100,
     locked: !!t.locked, flip: !!t.flip, flipScale: t.flip ? -1 : 1,
     layer: t.layer === "back" || t.layer === "front" ? t.layer : "normal", sx: 0, sy: 0,
     states: Array.isArray(t.states) ? t.states.map((s: any) => ({ kind: s.kind, assetId: s.asset_id })) : [],
@@ -1542,6 +1646,12 @@ async function hydrateLibraryAssets(library: Library): Promise<void> {
     const ext = fname.split(".").pop()!;
     const url = convertFileSrc(await invoke<string>("asset_path", { id, ext }));
     state.tracks.push({ id, name: fname, url, cover: null });
+  }
+  for (const [id, fname] of library.documents || []) {
+    if (state.documents.some(doc => doc.id === id)) continue;
+    const ext = fname.split(".").pop()!;
+    const url = convertFileSrc(await invoke<string>("asset_path", { id, ext }));
+    state.documents.push({ id, name: fname, url });
   }
 }
 

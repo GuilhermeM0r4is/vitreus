@@ -1,6 +1,6 @@
 [package]
 name = "vitreus"
-version = "0.1.0"
+version = "0.1.1"
 description = "Vitreus - gridless VTT"
 edition = "2021"
 
