@@ -33,6 +33,11 @@ pub struct Token {
     pub r: f64,
     pub facing: f64,
     pub light_facing: f64,
+    /// The light's angle relative to the token's own facing, maintained
+    /// while follow_token is on. Defaulted to 0 (directly ahead) for saves
+    /// made before this existed.
+    #[serde(default)]
+    pub light_facing_offset: f64,
     pub follow_token: bool,
     pub cone: f64,
     pub light: bool,

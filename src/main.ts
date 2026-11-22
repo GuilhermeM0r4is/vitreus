@@ -30,6 +30,12 @@ interface Token {
   x: number; y: number; r: number;
   facing: number; facingTarget: number;
   lightFacing: number; lightFacingTarget: number; followToken: boolean;
+  /** The light's angle relative to the token's own facing, maintained while
+   * followToken is on (captured the instant it's switched on, from whatever
+   * angle the light is at then, so "set 90°, re-enable follow" keeps
+   * following at 90° rather than snapping to 0°). Irrelevant while follow is
+   * off - the slider edits lightFacingTarget directly in that case. */
+  lightFacingOffset: number;
   cone: number; light: boolean; lightOffset: LightOffset;
   lightIntensity: number; lightRadius: number;
   locked: boolean; flip: boolean; flipScale: number;
@@ -194,7 +200,7 @@ function addToken(kind: string, x: number, y: number, assetId: string | null = n
   const t: Token = {
     id: uid(), kind, assetId, x, y, r: 26,
     facing: -Math.PI / 2, facingTarget: -Math.PI / 2,
-    lightFacing: -Math.PI / 2, lightFacingTarget: -Math.PI / 2, followToken: true,
+    lightFacing: -Math.PI / 2, lightFacingTarget: -Math.PI / 2, followToken: true, lightFacingOffset: 0,
     cone: 40, light: true, lightOffset: { dx: 0, dy: 0 },
     lightIntensity: 100, lightRadius: 100,
     locked: false, flip: false, flipScale: 1, sx: 0, sy: 0,
@@ -374,11 +380,15 @@ function tintLight(src: LightSource, poly: Vec2[], cw: number, ch: number): void
   const baseRadius = 360 * ((src.radius ?? 100) / 100);
   const originS = toScreen(src.x, src.y, cw, ch);
   if (src.cone < 359.5) {
+    // This used to clone `src` into a wider "penumbra" copy so clipToPoly's
+    // own arc-clip (since removed - see clipToPoly's comment) would use a
+    // softer edge. Neither clipToPoly nor fillTintGradient reads `.cone`
+    // anymore, so the clone was dead weight: an object allocation every
+    // frame, for every cone light, that no longer changed anything.
     ctx.save();
-    const penumbra = { ...src, cone: Math.min(360, src.cone + 14) };
-    if (clipToPoly(ctx, poly, penumbra, originS, cw, ch, baseRadius)) {
+    if (clipToPoly(ctx, poly, src, originS, cw, ch, baseRadius)) {
       ctx.globalCompositeOperation = "lighter";
-      fillTintGradient(ctx, penumbra, originS, baseRadius, 0.16);
+      fillTintGradient(ctx, src, originS, baseRadius, 0.16);
     }
     ctx.restore();
   }
@@ -613,15 +623,16 @@ function render(): void {
       t.facing = lerpAngle(t.facing, t.facingTarget, ROT_LERP);
       animationActive = true;
     } else t.facing = t.facingTarget;
-    // Following is continuous *tracking*, not a one-time snap: while it's on,
-    // the light's target keeps up with wherever the token is turning, each
-    // frame, exactly as before. The bug was that this ran even while follow
-    // was off (see the toggle handler), silently overwriting a manually-set
-    // angle the instant follow got switched back on. With follow off, this
-    // line simply does nothing, so lightFacingTarget keeps whatever value
-    // was last set by hand (by the angle slider) until the person either
-    // turns follow back on or changes it again themselves.
-    if (t.followToken) t.lightFacingTarget = t.facingTarget;
+    // Following is continuous tracking at a fixed *relative* angle, not a
+    // one-time snap to the token's own facing: while it's on, the light
+    // keeps that same offset from the token's facing as the token turns.
+    // The offset itself is only set once, at the instant follow is switched
+    // on (see the toggle handler) - from whatever angle the light is
+    // already at - so turning follow off, setting a new angle by hand, then
+    // back on resumes following at that new angle instead of resetting to
+    // directly-ahead. With follow off, this line does nothing, so
+    // lightFacingTarget keeps whatever the slider last set directly.
+    if (t.followToken) t.lightFacingTarget = t.facingTarget + t.lightFacingOffset;
     if (Math.abs(lerpAngle(t.lightFacing, t.lightFacingTarget, 1) - t.lightFacing) > 0.0005) {
       t.lightFacing = lerpAngle(t.lightFacing, t.lightFacingTarget, ROT_LERP);
       animationActive = true;
@@ -909,7 +920,7 @@ addEventListener("keydown", e => {
     state.wallDraft = null; state.repositioning = null;
     if (state.mergingToken) { state.mergingToken = null; canvas.classList.remove("merge-mode"); }
     if (state.openDocument) closeDocumentViewer();
-    closeCtxMenu(); closePalette();
+    closeCtxMenu(); closePalette(); closeLightSettingsPopup();
   }
   if (e.key === "Backspace") {
     if (state.selectedToken) { pushUndo(); state.tokens = state.tokens.filter(t => t.id !== state.selectedToken); state.selectedToken = null; closeCtxMenu(); return; }
@@ -997,16 +1008,10 @@ function openTokenMenu(t: Token, x: number, y: number): void {
     <div class="ctx-btns">
       <div class="ctx-btn" id="cSendBack" title="Send to back layer">${ic2("back")}</div>
       <div class="ctx-btn" id="cBringFront" title="Bring to front layer">${ic2("front")}</div>
+      <div class="ctx-btn${t.light ? " active" : ""}" id="cLightPop" title="Light settings">${ic2("bulb")}</div>
     </div>
-    <div class="ctx-row"><span>Light</span><div class="switch ${t.light ? "on" : ""}" id="cLight"></div></div>
-    <div class="ctx-row"><span>Follow token facing</span><div class="switch ${t.followToken ? "on" : ""}" id="cFollow"></div></div>
-    <div class="row" style="margin:6px 0 0;"><label><span>Cone</span>${numBox("cConeNum", 5, 360, t.cone)}</label><input type="range" id="cCone" min="5" max="360" value="${t.cone}"></div>
-    <div class="row" style="margin:6px 0 0;" id="cLARow"><label><span>Light angle</span>${numBox("cLANum", -180, 180, Math.round(t.lightFacingTarget * 180 / Math.PI))}</label><input type="range" id="cLA" min="-180" max="180" value="${Math.round(t.lightFacingTarget * 180 / Math.PI)}" ${t.followToken ? "disabled" : ""}></div>
-    <div class="row" style="margin:6px 0 0;"><label><span>Intensity</span>${numBox("cIntNum", 10, 400, t.lightIntensity ?? 100)}</label><input type="range" id="cInt" min="10" max="400" value="${t.lightIntensity ?? 100}"></div>
-    <div class="row" style="margin:6px 0 0;"><label><span>Radius</span>${numBox("cRadNum", 20, 800, t.lightRadius ?? 100)}</label><input type="range" id="cRad" min="20" max="800" value="${t.lightRadius ?? 100}"></div>
-    <div class="ctx-btn" id="cRecenter" title="Recenter light" style="margin-top:4px; width:100%;">${ic2("target")}</div>
   `;
-  positionMenu(x, y, t.states.length >= 2 ? 480 : 440);
+  positionMenu(x, y, t.states.length >= 2 ? 180 : 140);
   q<HTMLElement>("#cRotL").onclick = () => { pushUndo(); t.facingTarget -= Math.PI / 6; };
   q<HTMLElement>("#cMinus").onclick = () => { pushUndo(); t.r = Math.max(TOKEN_MIN_R, t.r - 6); };
   q<HTMLElement>("#cPlus").onclick = () => { pushUndo(); t.r = Math.min(TOKEN_MAX_R, t.r + 6); };
@@ -1014,20 +1019,10 @@ function openTokenMenu(t: Token, x: number, y: number): void {
   q<HTMLElement>("#cLockBtn").onclick = () => { pushUndo(); t.locked = !t.locked; openTokenMenu(t, x, y); };
   q<HTMLElement>("#cDup").onclick = () => { const copy = duplicateToken(t); closeCtxMenu(); selectToken(copy.id); };
   q<HTMLElement>("#cMerge").onclick = () => { beginMergeToken(t); closeCtxMenu(); };
-  q<HTMLElement>("#cLight").onclick = e => { pushUndo(); t.light = !t.light; (e.target as HTMLElement).classList.toggle("on", t.light); };
-  q<HTMLElement>("#cFollow").onclick = e => {
-    pushUndo(); t.followToken = !t.followToken; (e.target as HTMLElement).classList.toggle("on", t.followToken);
-    // No forced re-sync here: turning follow back on should resume tracking
-    // from whatever angle the light is currently at (manually set while
-    // follow was off), not snap it back to the token's body facing first.
-    openTokenMenu(t, x, y);
+  q<HTMLElement>("#cLightPop").onclick = ev => {
+    const r = (ev.currentTarget as HTMLElement).getBoundingClientRect();
+    openLightSettingsPopup(t, r.right, r.top);
   };
-  syncRangeNum(q("#cCone"), q("#cConeNum"), v => { t.cone = v; markSceneDirty(); });
-  syncRangeNum(q("#cLA"), q("#cLANum"), v => { t.lightFacingTarget = v * Math.PI / 180; markSceneDirty(); });
-  syncRangeNum(q("#cInt"), q("#cIntNum"), v => { t.lightIntensity = v; markSceneDirty(); });
-  syncRangeNum(q("#cRad"), q("#cRadNum"), v => { t.lightRadius = v; markSceneDirty(); });
-  q<HTMLElement>("#cReposition").onclick = () => { state.repositioning = t.id; canvas.classList.add("reposition-mode"); closeCtxMenu(); };
-  q<HTMLElement>("#cRecenter").onclick = () => { pushUndo(); t.lightOffset = { dx: 0, dy: 0 }; t.lightFacingTarget = t.facingTarget; openTokenMenu(t, x, y); };
   q<HTMLElement>("#cSendBack").onclick = () => { pushUndo(); t.layer = "back"; openTokenMenu(t, x, y); };
   q<HTMLElement>("#cBringFront").onclick = () => { pushUndo(); t.layer = "front"; openTokenMenu(t, x, y); };
   const statesEl = ctxmenu.querySelector("#cStates") as HTMLElement | null;
@@ -1035,6 +1030,66 @@ function openTokenMenu(t: Token, x: number, y: number): void {
     (el as HTMLElement).onclick = () => { pushUndo(); setTokenState(t, +(el as HTMLElement).dataset.state!); openTokenMenu(t, x, y); };
   });
 }
+
+/* ================= token light settings popup =================
+ * Split out of the token menu so the always-busy token menu doesn't show
+ * five light-related rows (Light/Follow/Cone/Angle/Intensity/Radius/
+ * Recenter) every time, whether or not the person is working with the
+ * light right now. Opens as a small secondary popup next to the light
+ * icon, the same way the color palette popup works. */
+const lightPopup = document.getElementById("lightPopup") as HTMLElement;
+function openLightSettingsPopup(t: Token, x: number, y: number): void {
+  lightPopup.innerHTML = `
+    <div class="ctx-row"><span>Light</span><div class="switch ${t.light ? "on" : ""}" id="pLight"></div></div>
+    <div class="ctx-row"><span>Follow token facing</span><div class="switch ${t.followToken ? "on" : ""}" id="pFollow"></div></div>
+    <div class="row" style="margin:6px 0 0;"><label><span>Cone</span>${numBox("pConeNum", 5, 360, t.cone)}</label><input type="range" id="pCone" min="5" max="360" value="${t.cone}"></div>
+    <div class="row" style="margin:6px 0 0;" id="pLARow"><label><span>Light angle</span>${numBox("pLANum", -180, 180, Math.round(t.lightFacingTarget * 180 / Math.PI))}</label><input type="range" id="pLA" min="-180" max="180" value="${Math.round(t.lightFacingTarget * 180 / Math.PI)}" ${t.followToken ? "disabled" : ""}></div>
+    <div class="row" style="margin:6px 0 0;"><label><span>Intensity</span>${numBox("pIntNum", 10, 400, t.lightIntensity ?? 100)}</label><input type="range" id="pInt" min="10" max="400" value="${t.lightIntensity ?? 100}"></div>
+    <div class="row" style="margin:6px 0 0;"><label><span>Radius</span>${numBox("pRadNum", 20, 800, t.lightRadius ?? 100)}</label><input type="range" id="pRad" min="20" max="800" value="${t.lightRadius ?? 100}"></div>
+    <div class="ctx-btns" style="margin-top:4px;">
+      <div class="ctx-btn" id="pReposition" title="Reposition light">${ic2("pin")}</div>
+      <div class="ctx-btn" id="pRecenter" title="Recenter light">${ic2("target")}</div>
+    </div>
+  `;
+  lightPopup.style.left = Math.min(x + 6, innerWidth - 206) + "px";
+  lightPopup.style.top = Math.min(y, innerHeight - 360) + "px";
+  lightPopup.classList.add("open");
+  const q2 = <T extends HTMLElement>(sel: string): T => lightPopup.querySelector(sel) as T;
+  q2<HTMLElement>("#pLight").onclick = e => { pushUndo(); t.light = !t.light; (e.target as HTMLElement).classList.toggle("on", t.light); };
+  q2<HTMLElement>("#pFollow").onclick = e => {
+    pushUndo(); t.followToken = !t.followToken; (e.target as HTMLElement).classList.toggle("on", t.followToken);
+    // Capture the relative offset *once*, right as follow turns on, from
+    // whatever angle the light is currently at - e.g. manually set to 90
+    // degrees while follow was off. From then on the per-frame loop holds
+    // that same offset from the token's facing as it turns. No capture
+    // needed when turning follow off; lightFacingTarget just stays put and
+    // the slider takes over editing it directly.
+    if (t.followToken) {
+      // Wrap into (-PI, PI] so the stored offset is always the shortest
+      // signed angle between the two, regardless of how many times either
+      // has wrapped around before now.
+      let diff = (t.lightFacingTarget - t.facingTarget) % (2 * Math.PI);
+      if (diff > Math.PI) diff -= 2 * Math.PI;
+      if (diff < -Math.PI) diff += 2 * Math.PI;
+      t.lightFacingOffset = diff;
+    }
+    openLightSettingsPopup(t, x, y);
+  };
+  syncRangeNum(q2("#pCone"), q2("#pConeNum"), v => { t.cone = v; markSceneDirty(); });
+  syncRangeNum(q2("#pLA"), q2("#pLANum"), v => { t.lightFacingTarget = v * Math.PI / 180; markSceneDirty(); });
+  syncRangeNum(q2("#pInt"), q2("#pIntNum"), v => { t.lightIntensity = v; markSceneDirty(); });
+  syncRangeNum(q2("#pRad"), q2("#pRadNum"), v => { t.lightRadius = v; markSceneDirty(); });
+  q2<HTMLElement>("#pReposition").onclick = () => { state.repositioning = t.id; canvas.classList.add("reposition-mode"); closeLightSettingsPopup(); closeCtxMenu(); };
+  q2<HTMLElement>("#pRecenter").onclick = () => {
+    pushUndo(); t.lightOffset = { dx: 0, dy: 0 }; t.lightFacingTarget = t.facingTarget; t.lightFacingOffset = 0;
+    openLightSettingsPopup(t, x, y);
+  };
+}
+function closeLightSettingsPopup(): void { lightPopup.classList.remove("open"); }
+addEventListener("mousedown", e => {
+  if (lightPopup.classList.contains("open") && !lightPopup.contains(e.target as Node)) closeLightSettingsPopup();
+}, true);
+
 function openLightMenu(l: LightPoint, x: number, y: number): void {
   state.selectedLight = l.id;
   ctxmenu.innerHTML = `
@@ -1070,7 +1125,7 @@ function openMapMenu(m: MapObject, x: number, y: number): void {
   q<HTMLElement>("#mLock").onclick = () => { pushUndo(); m.locked = !m.locked; openMapMenu(m, x, y); };
   q<HTMLElement>("#mLayer").onclick = () => { pushUndo(); m.layer = m.layer === "front" ? "back" : "front"; openMapMenu(m, x, y); };
 }
-function closeCtxMenu(): void { ctxmenu.classList.remove("open"); state.selectedLight = null; }
+function closeCtxMenu(): void { ctxmenu.classList.remove("open"); state.selectedLight = null; closeLightSettingsPopup(); }
 addEventListener("mousedown", e => {
   if (ctxmenu.classList.contains("open") && !ctxmenu.contains(e.target as Node) && e.target !== canvas) closeCtxMenu();
 }, true);
@@ -1487,14 +1542,19 @@ async function importAudioTracks(): Promise<void> {
 }
 /* ================= document sheet viewer (side panel) ================= */
 const docViewer = document.getElementById("docViewer") as HTMLElement;
+const docViewerBody = document.getElementById("docViewerBody") as HTMLElement;
 const docViewerImg = document.getElementById("docViewerImg") as HTMLImageElement;
+const docViewerResize = document.getElementById("docViewerResize") as HTMLElement;
 const DOC_ZOOM_MIN = 0.25, DOC_ZOOM_MAX = 4;
+const DOC_WIDTH_MIN = 260, DOC_WIDTH_MAX_FRACTION = 0.9; // vs innerWidth, so it can't swallow the whole window
+const DOC_WIDTH_KEY = "vitreus-doc-viewer-width";
 function openDocumentViewer(id: string): void {
   const doc = state.documents.find(d => d.id === id);
   if (!doc) return;
   state.openDocument = id; state.documentZoom = 1;
   docViewerImg.src = doc.url;
   docViewerImg.style.transform = "scale(1)";
+  docViewerBody.scrollLeft = 0; docViewerBody.scrollTop = 0;
   docViewer.classList.add("open");
 }
 function closeDocumentViewer(): void {
@@ -1511,6 +1571,64 @@ function setDocumentZoom(z: number): void {
 (document.getElementById("docZoomIn") as HTMLElement).onclick = () => setDocumentZoom(state.documentZoom + 0.25);
 (document.getElementById("docZoomOut") as HTMLElement).onclick = () => setDocumentZoom(state.documentZoom - 0.25);
 (document.getElementById("docClose") as HTMLElement).onclick = closeDocumentViewer;
+
+// --- panel width resize (drag the left edge) ---
+// Restores whatever width the person last dragged to, same idea as other
+// per-device UI preferences - stored locally, not part of the saved
+// campaign, since it's a property of the window, not the scene.
+try {
+  const savedWidth = localStorage.getItem(DOC_WIDTH_KEY);
+  if (savedWidth) docViewer.style.width = savedWidth + "px";
+} catch { /* localStorage unavailable (e.g. private mode) - fall back to the CSS default width */ }
+let resizingViewer = false, resizeStartX = 0, resizeStartWidth = 0;
+docViewerResize.addEventListener("mousedown", e => {
+  if (e.button !== 0) return; // only a plain left-click drags the handle
+  e.preventDefault();
+  resizingViewer = true; resizeStartX = e.clientX; resizeStartWidth = docViewer.getBoundingClientRect().width;
+  docViewer.classList.add("resizing"); docViewerResize.classList.add("active");
+});
+addEventListener("mousemove", e => {
+  if (!resizingViewer) return;
+  // Dragging the *left* edge of a right-docked panel: moving the cursor
+  // left (negative delta) should widen it, so the new width is the start
+  // width minus how far right the cursor has moved.
+  const next = resizeStartWidth - (e.clientX - resizeStartX);
+  const max = innerWidth * DOC_WIDTH_MAX_FRACTION;
+  docViewer.style.width = Math.min(max, Math.max(DOC_WIDTH_MIN, next)) + "px";
+});
+addEventListener("mouseup", () => {
+  if (!resizingViewer) return;
+  resizingViewer = false;
+  docViewer.classList.remove("resizing"); docViewerResize.classList.remove("active");
+  try { localStorage.setItem(DOC_WIDTH_KEY, Math.round(docViewer.getBoundingClientRect().width).toString()); } catch { /* ignore */ }
+});
+
+// --- pan inside the viewer (left-click drag or middle-click drag) ---
+// overflow:auto already gives native scrollbars; this adds click-and-drag
+// panning on top, the way an image viewer or map tool usually works, for
+// both the primary mouse button and the middle button (common wheel-click
+// pan convention) without needing a modifier key.
+let panningDoc = false, panDocStartX = 0, panDocStartY = 0, panDocScrollX = 0, panDocScrollY = 0;
+docViewerBody.addEventListener("mousedown", e => {
+  if (e.button !== 0 && e.button !== 1) return; // left or middle only
+  e.preventDefault();
+  panningDoc = true; panDocStartX = e.clientX; panDocStartY = e.clientY;
+  panDocScrollX = docViewerBody.scrollLeft; panDocScrollY = docViewerBody.scrollTop;
+  docViewerBody.classList.add("panning");
+});
+addEventListener("mousemove", e => {
+  if (!panningDoc) return;
+  docViewerBody.scrollLeft = panDocScrollX - (e.clientX - panDocStartX);
+  docViewerBody.scrollTop = panDocScrollY - (e.clientY - panDocStartY);
+});
+addEventListener("mouseup", () => {
+  if (!panningDoc) return;
+  panningDoc = false;
+  docViewerBody.classList.remove("panning");
+});
+// Middle-click (auto-scroll icon / paste-on-Linux) has default browser
+// behaviors this panel doesn't want; suppressed only within the viewer.
+docViewerBody.addEventListener("auxclick", e => { if (e.button === 1) e.preventDefault(); });
 
 async function importDocumentImages(): Promise<void> {
   const paths = await pickFiles([{ name: "Image", extensions: ["png", "jpg", "jpeg", "webp"] }], true);
@@ -1538,7 +1656,7 @@ function sceneSnapshot() {
   return {
     tokens: state.tokens.map(t => ({
       id: t.id, kind: t.kind, asset_id: t.assetId, x: t.x, y: t.y, r: t.r,
-      facing: t.facing, light_facing: t.lightFacing, follow_token: t.followToken, cone: t.cone, light: t.light,
+      facing: t.facing, light_facing: t.lightFacing, light_facing_offset: t.lightFacingOffset, follow_token: t.followToken, cone: t.cone, light: t.light,
       light_offset: { x: t.lightOffset.dx, y: t.lightOffset.dy },
       light_intensity: t.lightIntensity ?? 100, light_radius: t.lightRadius ?? 100,
       locked: t.locked, flip: t.flip, layer: t.layer,
@@ -1568,6 +1686,7 @@ function loadScene(scene: any): void {
     id: t.id, kind: t.kind, assetId: t.asset_id, x: t.x, y: t.y, r: t.r,
     facing: t.facing, facingTarget: t.facing,
     lightFacing: t.light_facing ?? t.facing, lightFacingTarget: t.light_facing ?? t.facing,
+    lightFacingOffset: t.light_facing_offset ?? 0,
     followToken: t.follow_token !== false, cone: t.cone, light: t.light,
     lightOffset: { dx: t.light_offset?.x ?? 0, dy: t.light_offset?.y ?? 0 },
     lightIntensity: t.light_intensity ?? 100, lightRadius: t.light_radius ?? 100,
