@@ -638,6 +638,118 @@ pub fn asset_path(
     Ok(p.to_string_lossy().to_string())
 }
 
+/// Removes one asset (a single token image, map image, audio track, or
+/// document image) from the library and deletes its file on disk. `kind`
+/// selects which collection to look in, same values as `import_asset`
+/// accepts ("token" | "map" | "audio" | "document"). Used both for
+/// deleting one asset directly and for deleting every asset that belonged
+/// to a folder that's being removed (see delete_folder) - in both cases
+/// the file is actually removed rather than just dropped from the index,
+/// so repeatedly importing and deleting doesn't silently leak files into
+/// the app's data directory over a long campaign.
+#[tauri::command]
+pub fn delete_asset(state: State<Mutex<AppState>>, kind: String, id: String) -> Result<(), String> {
+    let dir = state.lock().unwrap().data_dir.clone();
+    if !valid_asset_id(&id) {
+        return Err("Invalid asset id".into());
+    }
+    let mut lib = load_library(&dir);
+    // Each arm removes the library entry (if present) and reports the file
+    // name(s) to delete on disk - a real track/document/token/map always has
+    // a non-empty recorded name, so `Some(name)` vs `None` cleanly means
+    // "found it" vs "nothing by that id existed", with no sentinel values.
+    let removed_names: Option<Vec<String>> = match kind.as_str() {
+        "token" => lib.token_assets.remove(&id).map(|(_, name)| vec![name]),
+        "map" => lib.map_assets.remove(&id).map(|(_, name)| vec![name]),
+        "audio" => {
+            let before = lib.tracks.len();
+            lib.tracks.retain(|(asset_id, _)| asset_id != &id);
+            (lib.tracks.len() < before).then(Vec::new) // see fallback extension scan below
+        }
+        "document" => {
+            let mut removed_name = None;
+            lib.documents.retain(|(asset_id, name)| {
+                if asset_id == &id {
+                    removed_name = Some(name.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            removed_name.map(|name| vec![name])
+        }
+        _ => return Err("Unsupported asset type".into()),
+    };
+    let Some(names) = removed_names else {
+        return Err("Asset does not exist in the library".into());
+    };
+    save_library(&dir, &lib)?;
+    // Best-effort file cleanup: the library entry is already gone (and saved)
+    // at this point, so a missing or unreadable file here doesn't leave the
+    // library inconsistent - it just means there was nothing to clean up,
+    // which is fine rather than failing the whole deletion over it.
+    if names.is_empty() {
+        // Audio: tracks don't carry a recorded file name the way the other
+        // three kinds do, so try every extension import_asset accepts for
+        // this kind rather than guessing one.
+        for ext in ["mp3", "wav", "ogg", "m4a"] {
+            let _ = fs::remove_file(asset_file(&dir, &id, ext));
+        }
+    } else {
+        for name in &names {
+            if let Some(ext) = Path::new(name).extension().and_then(|e| e.to_str()) {
+                let _ = fs::remove_file(asset_file(&dir, &id, &ext.to_ascii_lowercase()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Removes a token/map asset folder and every asset inside it - actually
+/// deleting those assets (library entry + file on disk), not moving them
+/// into another folder. `kind` is "token" or "map". The "root" folder
+/// can't be deleted (same rule the frontend already enforces by always
+/// keeping it in the list); this command enforces it again server-side.
+#[tauri::command]
+pub fn delete_asset_folder(
+    state: State<Mutex<AppState>>,
+    kind: String,
+    folder_id: String,
+) -> Result<(), String> {
+    if folder_id == "root" {
+        return Err("The root folder can't be deleted".into());
+    }
+    let dir = state.lock().unwrap().data_dir.clone();
+    let mut lib = load_library(&dir);
+    let (folders, assets): (
+        &mut Vec<AssetFolder>,
+        &mut std::collections::HashMap<String, (String, String)>,
+    ) = match kind.as_str() {
+        "token" => (&mut lib.token_folders, &mut lib.token_assets),
+        "map" => (&mut lib.map_folders, &mut lib.map_assets),
+        _ => return Err("Unsupported folder type".into()),
+    };
+    if !folders.iter().any(|f| f.id == folder_id) {
+        return Err("Folder does not exist".into());
+    }
+    let to_remove: Vec<(String, String)> = assets
+        .iter()
+        .filter(|(_, (fid, _))| fid == &folder_id)
+        .map(|(id, (_, name))| (id.clone(), name.clone()))
+        .collect();
+    for (id, _) in &to_remove {
+        assets.remove(id);
+    }
+    folders.retain(|f| f.id != folder_id);
+    save_library(&dir, &lib)?;
+    for (id, name) in &to_remove {
+        if let Some(ext) = Path::new(name).extension().and_then(|e| e.to_str()) {
+            let _ = fs::remove_file(asset_file(&dir, id, &ext.to_ascii_lowercase()));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct LightReq {
     pub ox: f64,

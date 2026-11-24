@@ -30,6 +30,8 @@ fn main() {
             commands::import_campaign,
             commands::import_asset,
             commands::asset_path,
+            commands::delete_asset,
+            commands::delete_asset_folder,
             commands::compute_visibility_batch,
             commands::clear_all_data,
         ])

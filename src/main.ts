@@ -24,7 +24,7 @@ function worldOffsetToLocal(o: LightOffset, facing: number): LightOffset {
 }
 interface Camera { x: number; y: number; zoom: number; }
 
-interface TokenState { kind: string; assetId: string | null; }
+interface TokenState { kind: string; assetId: string | null; radius: number; }
 interface Token {
   id: string; kind: string; assetId: string | null;
   x: number; y: number; r: number;
@@ -37,7 +37,7 @@ interface Token {
    * off - the slider edits lightFacingTarget directly in that case. */
   lightFacingOffset: number;
   cone: number; light: boolean; lightOffset: LightOffset;
-  lightIntensity: number; lightRadius: number;
+  lightIntensity: number; lightRadius: number; lightColor: string;
   locked: boolean; flip: boolean; flipScale: number;
   layer: "back" | "normal" | "front";
   sx: number; sy: number;
@@ -202,7 +202,7 @@ function addToken(kind: string, x: number, y: number, assetId: string | null = n
     facing: -Math.PI / 2, facingTarget: -Math.PI / 2,
     lightFacing: -Math.PI / 2, lightFacingTarget: -Math.PI / 2, followToken: true, lightFacingOffset: 0,
     cone: 40, light: true, lightOffset: { dx: 0, dy: 0 },
-    lightIntensity: 100, lightRadius: 100,
+    lightIntensity: 100, lightRadius: 100, lightColor: state.lightColor,
     locked: false, flip: false, flipScale: 1, sx: 0, sy: 0,
     layer: "normal", states: [], activeState: 0,
   };
@@ -238,8 +238,12 @@ function beginMergeToken(t: Token): void {
  * is removed from the scene. */
 function completeMergeToken(a: Token, b: Token): void {
   pushUndo();
-  if (a.states.length === 0) a.states.push({ kind: a.kind, assetId: a.assetId });
-  a.states.push({ kind: b.kind, assetId: b.assetId });
+  // Each state remembers its own size - b's own radius becomes state 2's
+  // size, so merging in a smaller/bigger token (e.g. a standard pose vs. a
+  // crouching one) keeps that difference instead of forcing both states to
+  // a's current size.
+  if (a.states.length === 0) a.states.push({ kind: a.kind, assetId: a.assetId, radius: a.r });
+  a.states.push({ kind: b.kind, assetId: b.assetId, radius: b.r });
   state.tokens = state.tokens.filter(x => x.id !== b.id);
   if (state.selectedToken === b.id) selectToken(a.id);
   state.mergingToken = null;
@@ -247,12 +251,22 @@ function completeMergeToken(a: Token, b: Token): void {
   markSceneDirty();
 }
 /** Switches a merged token to the given 0-based state index, updating its
- * visible kind/asset in place. A no-op for tokens with no states. */
+ * visible kind/asset/size in place. A no-op for tokens with no states. */
 function setTokenState(t: Token, index: number): void {
   if (!t.states.length || index < 0 || index >= t.states.length) return;
   const s = t.states[index];
   t.activeState = index; t.kind = s.kind; t.assetId = s.assetId;
+  if (s.radius) t.r = Math.min(TOKEN_MAX_R, Math.max(TOKEN_MIN_R, s.radius));
   markSceneDirty();
+}
+/** Sets a token's radius, keeping the currently-active state's own stored
+ * size in sync for a merged token - otherwise resizing while state 2 is
+ * active would be silently lost the moment the person switched states and
+ * back, since setTokenState would restore the old stored radius. Every
+ * place that changes t.r directly should go through this instead. */
+function resizeToken(t: Token, r: number): void {
+  t.r = Math.min(TOKEN_MAX_R, Math.max(TOKEN_MIN_R, r));
+  if (t.states.length) t.states[t.activeState].radius = t.r;
 }
 
 function loadImage(id: string, url: string): Promise<HTMLImageElement | null> {
@@ -647,7 +661,7 @@ function render(): void {
       const worldOff = localOffsetToWorld(t.lightOffset, t.facing);
       activeLights.push({
         x: t.x + worldOff.dx, y: t.y + worldOff.dy, facing: t.lightFacing,
-        cone: t.cone, color: state.lightColor, intensity: t.lightIntensity ?? 100, radius: t.lightRadius ?? 100, flicker: 1,
+        cone: t.cone, color: t.lightColor || state.lightColor, intensity: t.lightIntensity ?? 100, radius: t.lightRadius ?? 100, flicker: 1,
       });
     }
   }
@@ -940,8 +954,8 @@ addEventListener("keydown", e => {
   if (t && !t.locked && !targetIsMap) {
     if (e.key === "q" || e.key === "Q") { t.facingTarget -= Math.PI / 9; markSceneDirty(); return; }
     if (e.key === "e" || e.key === "E") { t.facingTarget += Math.PI / 9; markSceneDirty(); return; }
-    if (e.key === "+" || e.key === "=") { t.r = Math.min(TOKEN_MAX_R, t.r + 4); markSceneDirty(); return; }
-    if (e.key === "-" || e.key === "_") { t.r = Math.max(TOKEN_MIN_R, t.r - 4); markSceneDirty(); return; }
+    if (e.key === "+" || e.key === "=") { resizeToken(t, t.r + 4); markSceneDirty(); return; }
+    if (e.key === "-" || e.key === "_") { resizeToken(t, t.r - 4); markSceneDirty(); return; }
     if (e.key === "f" || e.key === "F") { t.flip = !t.flip; markSceneDirty(); return; }
     if (t.states.length >= 2 && e.key >= "1" && e.key <= "9") {
       const idx = +e.key - 1;
@@ -1013,13 +1027,17 @@ function openTokenMenu(t: Token, x: number, y: number): void {
   `;
   positionMenu(x, y, t.states.length >= 2 ? 180 : 140);
   q<HTMLElement>("#cRotL").onclick = () => { pushUndo(); t.facingTarget -= Math.PI / 6; };
-  q<HTMLElement>("#cMinus").onclick = () => { pushUndo(); t.r = Math.max(TOKEN_MIN_R, t.r - 6); };
-  q<HTMLElement>("#cPlus").onclick = () => { pushUndo(); t.r = Math.min(TOKEN_MAX_R, t.r + 6); };
+  q<HTMLElement>("#cMinus").onclick = () => { pushUndo(); resizeToken(t, t.r - 6); };
+  q<HTMLElement>("#cPlus").onclick = () => { pushUndo(); resizeToken(t, t.r + 6); };
   q<HTMLElement>("#cDel").onclick = () => { pushUndo(); state.tokens = state.tokens.filter(x => x.id !== t.id); closeCtxMenu(); };
   q<HTMLElement>("#cLockBtn").onclick = () => { pushUndo(); t.locked = !t.locked; openTokenMenu(t, x, y); };
   q<HTMLElement>("#cDup").onclick = () => { const copy = duplicateToken(t); closeCtxMenu(); selectToken(copy.id); };
   q<HTMLElement>("#cMerge").onclick = () => { beginMergeToken(t); closeCtxMenu(); };
   q<HTMLElement>("#cLightPop").onclick = ev => {
+    // Toggle: clicking the bulb again while its own popup is already open
+    // for this token closes it, instead of tearing it down and immediately
+    // reopening it (which looked like it was refusing to close at all).
+    if (lightPopup.classList.contains("open") && lightPopupTokenId === t.id) { closeLightSettingsPopup(); return; }
     const r = (ev.currentTarget as HTMLElement).getBoundingClientRect();
     openLightSettingsPopup(t, r.right, r.top);
   };
@@ -1038,7 +1056,9 @@ function openTokenMenu(t: Token, x: number, y: number): void {
  * light right now. Opens as a small secondary popup next to the light
  * icon, the same way the color palette popup works. */
 const lightPopup = document.getElementById("lightPopup") as HTMLElement;
+let lightPopupTokenId: string | null = null;
 function openLightSettingsPopup(t: Token, x: number, y: number): void {
+  lightPopupTokenId = t.id;
   lightPopup.innerHTML = `
     <div class="ctx-row"><span>Light</span><div class="switch ${t.light ? "on" : ""}" id="pLight"></div></div>
     <div class="ctx-row"><span>Follow token facing</span><div class="switch ${t.followToken ? "on" : ""}" id="pFollow"></div></div>
@@ -1046,13 +1066,14 @@ function openLightSettingsPopup(t: Token, x: number, y: number): void {
     <div class="row" style="margin:6px 0 0;" id="pLARow"><label><span>Light angle</span>${numBox("pLANum", -180, 180, Math.round(t.lightFacingTarget * 180 / Math.PI))}</label><input type="range" id="pLA" min="-180" max="180" value="${Math.round(t.lightFacingTarget * 180 / Math.PI)}" ${t.followToken ? "disabled" : ""}></div>
     <div class="row" style="margin:6px 0 0;"><label><span>Intensity</span>${numBox("pIntNum", 10, 400, t.lightIntensity ?? 100)}</label><input type="range" id="pInt" min="10" max="400" value="${t.lightIntensity ?? 100}"></div>
     <div class="row" style="margin:6px 0 0;"><label><span>Radius</span>${numBox("pRadNum", 20, 800, t.lightRadius ?? 100)}</label><input type="range" id="pRad" min="20" max="800" value="${t.lightRadius ?? 100}"></div>
+    <div class="row" style="margin:8px 0 0;"><label><span>Color</span><span></span></label><input type="color" id="pColor" value="${t.lightColor || state.lightColor}"></div>
     <div class="ctx-btns" style="margin-top:4px;">
       <div class="ctx-btn" id="pReposition" title="Reposition light">${ic2("pin")}</div>
       <div class="ctx-btn" id="pRecenter" title="Recenter light">${ic2("target")}</div>
     </div>
   `;
   lightPopup.style.left = Math.min(x + 6, innerWidth - 206) + "px";
-  lightPopup.style.top = Math.min(y, innerHeight - 360) + "px";
+  lightPopup.style.top = Math.min(y, innerHeight - 400) + "px";
   lightPopup.classList.add("open");
   const q2 = <T extends HTMLElement>(sel: string): T => lightPopup.querySelector(sel) as T;
   q2<HTMLElement>("#pLight").onclick = e => { pushUndo(); t.light = !t.light; (e.target as HTMLElement).classList.toggle("on", t.light); };
@@ -1079,15 +1100,26 @@ function openLightSettingsPopup(t: Token, x: number, y: number): void {
   syncRangeNum(q2("#pLA"), q2("#pLANum"), v => { t.lightFacingTarget = v * Math.PI / 180; markSceneDirty(); });
   syncRangeNum(q2("#pInt"), q2("#pIntNum"), v => { t.lightIntensity = v; markSceneDirty(); });
   syncRangeNum(q2("#pRad"), q2("#pRadNum"), v => { t.lightRadius = v; markSceneDirty(); });
+  (q2<HTMLInputElement>("#pColor")).oninput = e => { t.lightColor = (e.target as HTMLInputElement).value; markSceneDirty(); };
   q2<HTMLElement>("#pReposition").onclick = () => { state.repositioning = t.id; canvas.classList.add("reposition-mode"); closeLightSettingsPopup(); closeCtxMenu(); };
   q2<HTMLElement>("#pRecenter").onclick = () => {
     pushUndo(); t.lightOffset = { dx: 0, dy: 0 }; t.lightFacingTarget = t.facingTarget; t.lightFacingOffset = 0;
     openLightSettingsPopup(t, x, y);
   };
 }
-function closeLightSettingsPopup(): void { lightPopup.classList.remove("open"); }
+function closeLightSettingsPopup(): void { lightPopup.classList.remove("open"); lightPopupTokenId = null; }
 addEventListener("mousedown", e => {
-  if (lightPopup.classList.contains("open") && !lightPopup.contains(e.target as Node)) closeLightSettingsPopup();
+  // The bulb trigger button itself is deliberately excluded here: without
+  // this, clicking it a second time (to close the popup) hit this listener
+  // first on mousedown's capture phase - since the button lives in #ctxmenu,
+  // not #lightPopup, that counted as "outside" and closed the popup right
+  // then - and only afterward did the button's own click handler run, by
+  // which point the popup already looked closed, so its toggle check
+  // reopened it instead of leaving it closed. Letting the button's own
+  // onclick be the single source of truth for its own click fixes that.
+  const target = e.target as HTMLElement;
+  const isTriggerButton = target.closest && target.closest("#cLightPop");
+  if (lightPopup.classList.contains("open") && !lightPopup.contains(target) && !isTriggerButton) closeLightSettingsPopup();
 }, true);
 
 function openLightMenu(l: LightPoint, x: number, y: number): void {
@@ -1127,7 +1159,14 @@ function openMapMenu(m: MapObject, x: number, y: number): void {
 }
 function closeCtxMenu(): void { ctxmenu.classList.remove("open"); state.selectedLight = null; closeLightSettingsPopup(); }
 addEventListener("mousedown", e => {
-  if (ctxmenu.classList.contains("open") && !ctxmenu.contains(e.target as Node) && e.target !== canvas) closeCtxMenu();
+  // The light settings popup is a separate element from #ctxmenu (so it can
+  // float next to its own trigger button rather than being clipped inside
+  // the token menu), but a click inside it still counts as "inside the menu
+  // session" here - otherwise this listener saw it as an outside click and
+  // closed everything (including the popup itself, via closeCtxMenu) before
+  // the popup's own button handlers ever got to run.
+  const insideLightPopup = lightPopup.classList.contains("open") && lightPopup.contains(e.target as Node);
+  if (ctxmenu.classList.contains("open") && !ctxmenu.contains(e.target as Node) && !insideLightPopup && e.target !== canvas) closeCtxMenu();
 }, true);
 
 /* ================= color palette popup (folders: recolor + delete) ================= */
@@ -1233,6 +1272,59 @@ function folderRow(
   return wrap;
 }
 
+/** A tiny popup with just a delete button, for removing one asset from its
+ * folder (right-click an asset thumbnail). Deliberately not openPalette,
+ * which always shows the full color swatch grid - irrelevant here, since a
+ * single image has no color of its own to recolor. */
+const assetDeletePopup = document.getElementById("assetDeletePopup") as HTMLElement;
+function openAssetDeletePopup(x: number, y: number, onDelete: () => void): void {
+  assetDeletePopup.innerHTML = `<div class="delsw">${icon("trash")}</div>`;
+  (assetDeletePopup.firstElementChild as HTMLElement).onclick = () => { onDelete(); closeAssetDeletePopup(); };
+  assetDeletePopup.style.left = Math.min(x, innerWidth - 60) + "px";
+  assetDeletePopup.style.top = Math.min(y, innerHeight - 40) + "px";
+  assetDeletePopup.classList.add("open");
+}
+function closeAssetDeletePopup(): void { assetDeletePopup.classList.remove("open"); }
+addEventListener("mousedown", e => {
+  if (assetDeletePopup.classList.contains("open") && !assetDeletePopup.contains(e.target as Node)) closeAssetDeletePopup();
+}, true);
+
+/** Deletes one token image: removes it from the library (and its file on
+ * disk, server-side) and drops it from state so it disappears from the
+ * grid immediately. Any token already placed on the board keeps showing
+ * its last-loaded image (state.assetImages caches the decoded bitmap) but
+ * won't be re-importable from the library once gone. */
+async function deleteTokenAsset(id: string): Promise<void> {
+  try { await invoke("delete_asset", { kind: "token", id }); } catch (e) { console.error("delete_asset(token) failed", e); return; }
+  state.tokenAssets = state.tokenAssets.filter(a => a.id !== id);
+  renderPanel();
+}
+async function deleteMapAsset(id: string): Promise<void> {
+  try { await invoke("delete_asset", { kind: "map", id }); } catch (e) { console.error("delete_asset(map) failed", e); return; }
+  state.maps = state.maps.filter(m => m.id !== id);
+  renderPanel();
+}
+/** Deletes a token folder and every asset inside it - actually deleting
+ * those assets, not moving them into whichever folder is now first in the
+ * list (the old, confusing behavior this replaces). The "root" folder is
+ * never offered for deletion by folderRow (it only shows a delete option
+ * via right-click when more than one folder exists, and root always stays
+ * in the list), so this never needs to guard against deleting it itself. */
+async function deleteTokenFolder(folderId: string): Promise<void> {
+  try { await invoke("delete_asset_folder", { kind: "token", folderId }); } catch (e) { console.error("delete_asset_folder(token) failed", e); return; }
+  state.tokenFolders = state.tokenFolders.filter(f => f.id !== folderId);
+  state.tokenAssets = state.tokenAssets.filter(a => a.folderId !== folderId);
+  if (state.currentFolder === folderId) state.currentFolder = state.tokenFolders[0].id;
+  renderPanel();
+}
+async function deleteMapFolder(folderId: string): Promise<void> {
+  try { await invoke("delete_asset_folder", { kind: "map", folderId }); } catch (e) { console.error("delete_asset_folder(map) failed", e); return; }
+  state.mapFolders = state.mapFolders.filter(f => f.id !== folderId);
+  state.maps = state.maps.filter(m => m.folderId !== folderId);
+  if (state.currentMapFolder === folderId) state.currentMapFolder = state.mapFolders[0].id;
+  renderPanel();
+}
+
 function escapeHtml(value: string): string {
   return value.replace(/[&<>'"]/g, character => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;",
@@ -1289,12 +1381,7 @@ function renderPanel(): void {
         id => { state.currentFolder = id; renderPanel(); },
         () => { const id = uid(); state.tokenFolders.push({ id, color: PALETTE[state.tokenFolders.length % PALETTE.length] }); state.currentFolder = id; persistMeta(); renderPanel(); },
         (f, color) => { f.color = color; persistMeta(); renderPanel(); },
-        f => {
-          state.tokenFolders = state.tokenFolders.filter(x => x.id !== f.id);
-          state.tokenAssets.forEach(a => { if (a.folderId === f.id) a.folderId = state.tokenFolders[0].id; });
-          if (state.currentFolder === f.id) state.currentFolder = state.tokenFolders[0].id;
-          persistMeta(); renderPanel();
-        }));
+        f => { void deleteTokenFolder(f.id); }));
       const grid = document.createElement("div"); grid.className = "asset-grid";
       state.tokenAssets.filter(a => a.folderId === state.currentFolder).forEach(a => {
         const el = document.createElement("div"); el.className = "asset-item";
@@ -1302,6 +1389,7 @@ function renderPanel(): void {
         el.draggable = true;
         el.onclick = () => addToken("img", state.camera.x + (Math.random() - 0.5) * 60, state.camera.y + (Math.random() - 0.5) * 60, a.id);
         el.ondragstart = e => { e.dataTransfer?.setData("application/x-vitreus-token", a.id); e.dataTransfer!.effectAllowed = "copy"; };
+        el.oncontextmenu = e => { e.preventDefault(); openAssetDeletePopup(e.clientX, e.clientY, () => void deleteTokenAsset(a.id)); };
         grid.appendChild(el);
       });
       body.appendChild(grid);
@@ -1312,17 +1400,13 @@ function renderPanel(): void {
         id => { state.currentMapFolder = id; renderPanel(); },
         () => { const id = uid(); state.mapFolders.push({ id, color: PALETTE[state.mapFolders.length % PALETTE.length] }); state.currentMapFolder = id; persistMeta(); renderPanel(); },
         (f, color) => { f.color = color; persistMeta(); renderPanel(); },
-        f => {
-          state.mapFolders = state.mapFolders.filter(x => x.id !== f.id);
-          state.maps.forEach(a => { if (a.folderId === f.id) a.folderId = state.mapFolders[0].id; });
-          if (state.currentMapFolder === f.id) state.currentMapFolder = state.mapFolders[0].id;
-          persistMeta(); renderPanel();
-        }));
+        f => { void deleteMapFolder(f.id); }));
       const grid = document.createElement("div"); grid.className = "asset-grid";
       state.maps.filter(m => m.folderId === state.currentMapFolder).forEach(m => {
         const el = document.createElement("div"); el.className = "asset-item";
         const im = document.createElement("img"); im.src = m.url; el.appendChild(im);
         el.draggable = true;
+        el.oncontextmenu = e => { e.preventDefault(); openAssetDeletePopup(e.clientX, e.clientY, () => void deleteMapAsset(m.id)); };
         el.onclick = () => { void addMapObject(m.id).then(() => renderPanel()); };
         el.ondragstart = e => { e.dataTransfer?.setData("application/x-vitreus-map", m.id); e.dataTransfer!.effectAllowed = "copy"; };
         grid.appendChild(el);
@@ -1658,9 +1742,9 @@ function sceneSnapshot() {
       id: t.id, kind: t.kind, asset_id: t.assetId, x: t.x, y: t.y, r: t.r,
       facing: t.facing, light_facing: t.lightFacing, light_facing_offset: t.lightFacingOffset, follow_token: t.followToken, cone: t.cone, light: t.light,
       light_offset: { x: t.lightOffset.dx, y: t.lightOffset.dy },
-      light_intensity: t.lightIntensity ?? 100, light_radius: t.lightRadius ?? 100,
+      light_intensity: t.lightIntensity ?? 100, light_radius: t.lightRadius ?? 100, light_color: t.lightColor || state.lightColor,
       locked: t.locked, flip: t.flip, layer: t.layer,
-      states: t.states.map(s => ({ kind: s.kind, asset_id: s.assetId })), active_state: t.activeState,
+      states: t.states.map(s => ({ kind: s.kind, asset_id: s.assetId, radius: s.radius })), active_state: t.activeState,
     })),
     walls: state.walls.map(w => ({ a: { x: w.a.x, y: w.a.y }, b: { x: w.b.x, y: w.b.y } })),
     lights: state.lights.map(l => ({ id: l.id, x: l.x, y: l.y, on: l.on, color: l.color || state.lightColor, intensity: l.intensity ?? 100, radius: l.radius ?? 100 })),
@@ -1689,10 +1773,10 @@ function loadScene(scene: any): void {
     lightFacingOffset: t.light_facing_offset ?? 0,
     followToken: t.follow_token !== false, cone: t.cone, light: t.light,
     lightOffset: { dx: t.light_offset?.x ?? 0, dy: t.light_offset?.y ?? 0 },
-    lightIntensity: t.light_intensity ?? 100, lightRadius: t.light_radius ?? 100,
+    lightIntensity: t.light_intensity ?? 100, lightRadius: t.light_radius ?? 100, lightColor: t.light_color ?? state.lightColor,
     locked: !!t.locked, flip: !!t.flip, flipScale: t.flip ? -1 : 1,
     layer: t.layer === "back" || t.layer === "front" ? t.layer : "normal", sx: 0, sy: 0,
-    states: Array.isArray(t.states) ? t.states.map((s: any) => ({ kind: s.kind, assetId: s.asset_id })) : [],
+    states: Array.isArray(t.states) ? t.states.map((s: any) => ({ kind: s.kind, assetId: s.asset_id, radius: s.radius ?? t.r })) : [],
     activeState: t.active_state ?? 0,
   }));
   state.walls = (scene.walls || []).map((w: any): Wall => ({ a: { x: w.a.x, y: w.a.y }, b: { x: w.b.x, y: w.b.y } }));

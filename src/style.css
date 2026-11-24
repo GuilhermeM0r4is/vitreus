@@ -64,6 +64,12 @@ input[type="text"]{width:100%; background:rgba(255,255,255,0.06); border:1px sol
 #palettePopup .sw{width:20px; height:20px; border-radius:6px; cursor:pointer;}
 #palettePopup .delsw{width:100%; height:24px; border-radius:6px; cursor:pointer; background:rgba(255,105,97,0.15); color:#ff6961; display:flex; align-items:center; justify-content:center; margin-top:4px;}
 #palettePopup .delsw svg{width:13px;height:13px;}
+#assetDeletePopup{position:fixed; z-index:60; display:none; background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:4px;
+  backdrop-filter:blur(22px); -webkit-backdrop-filter:blur(22px); box-shadow:0 10px 30px rgba(0,0,0,.5);}
+#assetDeletePopup.open{display:block;}
+#assetDeletePopup .delsw{width:36px; height:30px; border-radius:7px; cursor:pointer; background:rgba(255,105,97,0.15); color:#ff6961; display:flex; align-items:center; justify-content:center;}
+#assetDeletePopup .delsw:hover{background:rgba(255,105,97,0.26);}
+#assetDeletePopup .delsw svg{width:14px;height:14px;}
 
 #ctxmenu{position:fixed; width:168px; background:var(--panel); border:1px solid var(--border); border-radius:13px; backdrop-filter:blur(26px); -webkit-backdrop-filter:blur(26px);
   box-shadow:0 14px 40px rgba(0,0,0,.55); padding:8px; z-index:50; display:none;}

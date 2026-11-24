@@ -21,6 +21,12 @@ pub struct Wall {
 pub struct TokenState {
     pub kind: String, // "circle" | "tri" | "img"
     pub asset_id: Option<String>,
+    /// This state's own size, independent of the token's other states (e.g.
+    /// a smaller crouching pose vs. a bigger standing one). Defaulted to 0
+    /// for states saved before this existed; the frontend treats 0 as "use
+    /// whatever size the token already has" rather than an actual zero size.
+    #[serde(default)]
+    pub radius: f64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -50,6 +56,12 @@ pub struct Token {
     pub light_intensity: f64,
     #[serde(default = "default_light_radius")]
     pub light_radius: f64,
+    /// Empty for a token created before per-token light color existed, or
+    /// one that has never had its color changed - the frontend falls back
+    /// to the campaign's default light color in that case (see Token.ts's
+    /// `t.light_color ?? state.lightColor`).
+    #[serde(default)]
+    pub light_color: String,
     pub locked: bool,
     pub flip: bool,
     #[serde(default)]
